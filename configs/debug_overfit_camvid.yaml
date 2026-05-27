@@ -1,0 +1,38 @@
+experiment:
+  name: debug_overfit_camvid
+  output_dir: outputs/debug_overfit_camvid
+  seed: 42
+
+dataset:
+  name: camvid
+  root: /path/to/CamVid
+  num_classes: 11
+  ignore_index: 255
+  train_split: train
+  val_split: val
+  test_split: test
+  train_list: null
+  val_list: null
+  test_list: null
+  overfit_num_samples: 2
+  crop_size: [512, 512]
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+model:
+  name: fcn_resnet50
+  num_classes: 11
+  pretrained: true
+
+train:
+  epochs: 50
+  batch_size: 2
+  num_workers: 2
+  lr: 0.0001
+  weight_decay: 0.0001
+  amp: true
+  crop_size: [512, 512]
+
+eval:
+  batch_size: 2
+  save_predictions: true
