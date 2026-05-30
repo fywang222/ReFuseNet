@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import yaml
 
@@ -59,6 +60,15 @@ def build_metric(cfg, dataset):
     )
 
 
+def get_color_map(cfg):
+    name = cfg["dataset"]["name"].lower()
+    if name == "camvid":
+        return CAMVID_COLOR_MAP
+    if name == "cityscapes":
+        return CITYSCAPES_COLOR_MAP
+    return None
+
+
 def format_metrics(metrics: Dict, class_names: Optional[List[str]] = None):
     parts = [
         f"mIoU={metrics['miou']:.4f}",
@@ -87,6 +97,8 @@ def evaluate_model(model, loader, metric, device, save_dir=None, color_map=None)
         if not isinstance(outputs, dict) or "logits" not in outputs:
             raise TypeError("Model forward must return a dict with a 'logits' tensor.")
         logits = outputs["logits"]
+        if logits.shape[-2:] != masks.shape[-2:]:
+            logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
         metric.update(logits, masks)
 
         if save_dir is not None:

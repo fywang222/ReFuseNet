@@ -1,0 +1,39 @@
+experiment:
+  name: camvid_segformer_b5
+  output_dir: outputs/camvid_segformer_b5
+  seed: 42
+
+dataset:
+  name: camvid
+  root: /path/to/CamVid
+  num_classes: 11
+  ignore_index: 255
+  train_split: train
+  val_split: val
+  test_split: test
+  train_list: null
+  val_list: null
+  test_list: null
+  crop_size: [512, 512]
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+model:
+  name: segformer_b5
+  num_classes: 11
+  pretrained: true
+  checkpoint: nvidia/mit-b5
+
+train:
+  epochs: 80
+  batch_size: 2
+  num_workers: 4
+  lr: 0.00006
+  weight_decay: 0.01
+  amp: true
+  crop_size: [512, 512]
+
+eval:
+  batch_size: 2
+  save_predictions: true
+

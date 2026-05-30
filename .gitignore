@@ -11,7 +11,6 @@ checkpoints/
 *.ckpt
 
 data/
-data/datasets/
 *.zip
 *.tar
 *.tar.gz

@@ -19,13 +19,15 @@ def _strip_module_prefix(state_dict):
     return stripped
 
 
-def save_checkpoint(path, model, optimizer, epoch, metrics, extra=None):
+def save_checkpoint(path, model, optimizer, epoch, metrics, extra=None, scaler=None):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "epoch": int(epoch),
+        "epoch_completed": int(epoch) + 1,
         "model": _unwrap_model(model).state_dict(),
         "optimizer": optimizer.state_dict() if optimizer is not None else None,
+        "scaler": scaler.state_dict() if scaler is not None else None,
         "metrics": metrics,
         "extra": extra or {},
     }
@@ -33,7 +35,7 @@ def save_checkpoint(path, model, optimizer, epoch, metrics, extra=None):
     return path
 
 
-def load_checkpoint(path, model, optimizer=None, strict=False, match_shape=True, verbose=False):
+def load_checkpoint(path, model, optimizer=None, strict=False, match_shape=True, verbose=False, scaler=None):
     path = Path(path)
     checkpoint = torch.load(path, map_location="cpu")
     state_dict = checkpoint.get("model", checkpoint.get("state_dict", checkpoint))
@@ -70,5 +72,7 @@ def load_checkpoint(path, model, optimizer=None, strict=False, match_shape=True,
     if optimizer is not None and checkpoint.get("optimizer") is not None and not match_shape:
         optimizer.load_state_dict(checkpoint["optimizer"])
 
-    return checkpoint
+    if scaler is not None and checkpoint.get("scaler") is not None and not match_shape:
+        scaler.load_state_dict(checkpoint["scaler"])
 
+    return checkpoint

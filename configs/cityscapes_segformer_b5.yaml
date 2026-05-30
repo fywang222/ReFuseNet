@@ -1,0 +1,39 @@
+experiment:
+  name: cityscapes_segformer_b5
+  output_dir: outputs/cityscapes_segformer_b5
+  seed: 42
+
+dataset:
+  name: cityscapes
+  root: /path/to/Cityscapes
+  num_classes: 19
+  ignore_index: 255
+  train_split: train
+  val_split: val
+  test_split: test
+  train_list: null
+  val_list: null
+  test_list: null
+  crop_size: [512, 1024]
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+model:
+  name: segformer_b5
+  num_classes: 19
+  pretrained: true
+  checkpoint: nvidia/mit-b5
+
+train:
+  epochs: 100
+  batch_size: 1
+  num_workers: 4
+  lr: 0.00006
+  weight_decay: 0.01
+  amp: true
+  crop_size: [512, 1024]
+
+eval:
+  batch_size: 1
+  save_predictions: true
+

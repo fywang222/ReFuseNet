@@ -8,11 +8,17 @@ import torch.nn.functional as F
 from transformers import SegformerConfig, SegformerForSemanticSegmentation
 
 
-def _segformer_b1_config(num_classes, id2label, label2id):
+def _segformer_config(variant, num_classes, id2label, label2id):
+    if variant == "b1":
+        depths = [2, 2, 2, 2]
+    elif variant == "b5":
+        depths = [3, 6, 40, 3]
+    else:
+        raise ValueError(f"Unsupported SegFormer variant: {variant}")
     return SegformerConfig(
         num_channels=3,
         num_encoder_blocks=4,
-        depths=[2, 2, 2, 2],
+        depths=depths,
         hidden_sizes=[64, 128, 320, 512],
         decoder_hidden_size=256,
         hidden_dropout_prob=0.0,
@@ -29,10 +35,11 @@ def _segformer_b1_config(num_classes, id2label, label2id):
     )
 
 
-class SegFormerB1Segmentation(nn.Module):
-    def __init__(self, num_classes, pretrained=True, checkpoint="nvidia/mit-b1"):
+class SegFormerSegmentation(nn.Module):
+    def __init__(self, num_classes, pretrained=True, checkpoint="nvidia/mit-b5", variant="b5"):
         super().__init__()
         self.num_classes = num_classes
+        self.variant = variant
         id2label = {i: str(i) for i in range(num_classes)}
         label2id = {str(i): i for i in range(num_classes)}
         if pretrained:
@@ -45,17 +52,17 @@ class SegFormerB1Segmentation(nn.Module):
                     ignore_mismatched_sizes=True,
                 )
             except Exception as exc:
-                warnings.warn(f"Falling back to random init for SegFormer-B1: {exc}")
+                warnings.warn(f"Falling back to random init for SegFormer-{variant.upper()}: {exc}")
                 try:
                     config = SegformerConfig.from_pretrained(checkpoint)
                     config.num_labels = num_classes
                     config.id2label = id2label
                     config.label2id = label2id
                 except Exception:
-                    config = _segformer_b1_config(num_classes, id2label, label2id)
+                    config = _segformer_config(variant, num_classes, id2label, label2id)
                 self.model = SegformerForSemanticSegmentation(config)
         else:
-            config = _segformer_b1_config(num_classes, id2label, label2id)
+            config = _segformer_config(variant, num_classes, id2label, label2id)
             self.model = SegformerForSemanticSegmentation(config)
 
     def forward(self, x):
@@ -63,3 +70,13 @@ class SegFormerB1Segmentation(nn.Module):
         logits = self.model(pixel_values=x).logits
         logits = F.interpolate(logits, size=size, mode="bilinear", align_corners=False)
         return {"logits": logits, "aux": {}}
+
+
+class SegFormerB1Segmentation(SegFormerSegmentation):
+    def __init__(self, num_classes, pretrained=True, checkpoint="nvidia/mit-b1"):
+        super().__init__(num_classes=num_classes, pretrained=pretrained, checkpoint=checkpoint, variant="b1")
+
+
+class SegFormerB5Segmentation(SegFormerSegmentation):
+    def __init__(self, num_classes, pretrained=True, checkpoint="nvidia/mit-b5"):
+        super().__init__(num_classes=num_classes, pretrained=pretrained, checkpoint=checkpoint, variant="b5")
