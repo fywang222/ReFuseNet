@@ -42,8 +42,8 @@ model:
     iters: 3
 
 train:
-  epochs: 80
-  batch_size: 8
+  epochs: 100
+  batch_size: 4
   num_workers: 8
   lr_decoder: 1.0e-4
   lr_sam: 1.0e-5

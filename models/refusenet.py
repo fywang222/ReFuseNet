@@ -745,15 +745,17 @@ class RefuseNet(nn.Module):
             decoder_inputs = intermediate_features
             decoder_out = self.decoder(decoder_inputs, output_size, return_features=self.debug)
 
-        coarse_logits = self._restore_logits(decoder_out["logits"], preprocess_meta)
-        logits = coarse_logits
+        coarse_logits_processed = decoder_out["logits"]
+        logits_processed = coarse_logits_processed
         returned_coarse = None
         if self.refiner is not None:
-            logits = self._restore_logits(
-                self.refiner(coarse_logits, decoder_out["decoder_features"]),
-                preprocess_meta,
+            logits_processed = self.refiner(
+                coarse_logits_processed,
+                decoder_out["decoder_features"],
             )
-            returned_coarse = coarse_logits
+            returned_coarse = self._restore_logits(coarse_logits_processed, preprocess_meta)
+
+        logits = self._restore_logits(logits_processed, preprocess_meta)
 
         out: dict[str, torch.Tensor | None | dict[str, Any]] = {"logits": logits}
         if returned_coarse is not None:
