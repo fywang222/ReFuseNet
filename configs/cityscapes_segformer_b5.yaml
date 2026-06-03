@@ -26,7 +26,7 @@ model:
   name: segformer_b5
   num_classes: 19
   pretrained: true
-  checkpoint: nvidia/mit-b5
+  checkpoint: /data/xicheng/ReFuseNet/checkpoints/nvidia_mit-b5
 
 train:
   epochs: 100

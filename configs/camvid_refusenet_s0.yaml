@@ -30,8 +30,8 @@ model:
 
 train:
   epochs: 80
-  batch_size: 1
-  num_workers: 2
+  batch_size: 8
+  num_workers: 8
   lr_decoder: 1.0e-4
   lr_sam: 1.0e-5
   weight_decay: 0.0001
@@ -43,6 +43,6 @@ train:
   save_every: 10
 
 eval:
-  batch_size: 1
+  batch_size: 4
   inference: whole
   save_predictions: true

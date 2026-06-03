@@ -1,36 +1,64 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Fill these before running, or export them in your shell.
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_PROJECT="${WANDB_PROJECT:-refusenet}"
 export SAM_VIT_B_CHECKPOINT="${SAM_VIT_B_CHECKPOINT:-/absolute/path/to/sam_vit_b.pth}"
 
 PYTHON="${PYTHON:-python}"
 DEVICE="${DEVICE:-cuda}"
-EPOCHS="${EPOCHS:-200}"
-SAVE_EPOCHS="${SAVE_EPOCHS:-50,100,150,200}"
+
+# 默认用物理 GPU 4,5,6,7
+GPUS=(${GPUS:-4 5 6 7})
+
+mkdir -p outputs/logs
 
 if [[ -n "${WANDB_API_KEY}" ]]; then
   wandb login "${WANDB_API_KEY}"
 fi
 
-"${PYTHON}" tools/train.py \
-  --config configs/cityscapes_fcn_resnet50.yaml \
-  --device "${DEVICE}" \
-  --epochs "${EPOCHS}" \
-  --save-epochs "${SAVE_EPOCHS}"
+CONFIGS=(
+  "configs/cityscapes_fcn_resnet50.yaml"
+  "configs/cityscapes_segformer_b5.yaml"
+  "configs/ablation/cityscapes_refusenet_s0.yaml"
+  "configs/ablation/cityscapes_refusenet_s1.yaml"
+  "configs/ablation/cityscapes_refusenet_s2.yaml"
+  "configs/ablation/cityscapes_refusenet_s3.yaml"
+  "configs/ablation/cityscapes_refusenet_s4.yaml"
+  "configs/ablation/cityscapes_refusenet_s5.yaml"
+)
 
-"${PYTHON}" tools/train.py \
-  --config configs/cityscapes_segformer_b5.yaml \
-  --device "${DEVICE}" \
-  --epochs "${EPOCHS}" \
-  --save-epochs "${SAVE_EPOCHS}"
+run_one() {
+  local gpu="$1"
+  local config="$2"
+  local name
+  name="$(basename "${config}" .yaml)"
 
-for setting in s0 s1 s2 s3 s4 s5; do
-  "${PYTHON}" tools/train.py \
-    --config "configs/ablation/cityscapes_refusenet_${setting}.yaml" \
+  echo "[launch] GPU=${gpu} config=${config}"
+
+  CUDA_VISIBLE_DEVICES="${gpu}" "${PYTHON}" tools/train.py \
+    --config "${config}" \
     --device "${DEVICE}" \
-    --epochs "${EPOCHS}" \
-    --save-epochs "${SAVE_EPOCHS}"
+    2>&1 | tee "outputs/logs/${name}.console.log"
+}
+
+batch_size="${#GPUS[@]}"
+num_configs="${#CONFIGS[@]}"
+
+for ((start=0; start<num_configs; start+=batch_size)); do
+  echo "========== launching batch starting at index ${start} =========="
+
+  for ((i=0; i<batch_size; i++)); do
+    idx=$((start + i))
+    if (( idx >= num_configs )); then
+      break
+    fi
+
+    run_one "${GPUS[$i]}" "${CONFIGS[$idx]}" &
+  done
+
+  wait
+  echo "========== batch finished =========="
 done
+
+echo "All Cityscapes jobs finished."

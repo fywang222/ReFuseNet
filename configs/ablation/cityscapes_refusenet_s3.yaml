@@ -10,7 +10,7 @@ dataset:
   ignore_index: 255
   train_split: train
   val_split: val
-  test_split: test
+  test_split: val
   train_list: null
   val_list: null
   test_list: null
@@ -38,15 +38,19 @@ model:
 
 train:
   epochs: 80
-  batch_size: 1
-  num_workers: 2
+  batch_size: 8
+  num_workers: 8
   lr_decoder: 1.0e-4
   lr_sam: 1.0e-5
   weight_decay: 0.0001
   amp: true
 
+  log_every_steps: 10
+  eval_every: 5
+  save_every: 10
+
 eval:
-  batch_size: 1
+  batch_size: 4
   inference: sliding
   sliding_crop_size: [1024, 1024]
   sliding_stride: [768, 768]

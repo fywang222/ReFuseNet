@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import SegformerForSemanticSegmentation
-
+from pathlib import Path
 
 class SegFormerSegmentation(nn.Module):
     def __init__(self, num_classes, pretrained=True, checkpoint="nvidia/mit-b5", variant="b5"):
@@ -20,6 +20,7 @@ class SegFormerSegmentation(nn.Module):
             id2label=id2label,
             label2id=label2id,
             ignore_mismatched_sizes=True,
+            local_files_only=Path(checkpoint).exists(),
         )
 
     def forward(self, x):
