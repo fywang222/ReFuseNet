@@ -89,11 +89,17 @@ class CityscapesDataset(Dataset):
             mask_path = Path(parts[1])
             if not mask_path.is_absolute():
                 mask_path = self.root / mask_path
+            if not image_path.exists():
+                raise FileNotFoundError(f"Cityscapes image not found: {image_path}")
+            if not mask_path.exists():
+                raise FileNotFoundError(f"Cityscapes label not found: {mask_path}")
             return image_path, mask_path
         city = image_path.parent.name
         base = image_path.name.replace("_leftImg8bit.png", "")
         mask_path = self.root / "gtFine" / self.split / city / f"{base}_gtFine_labelIds.png"
-        return image_path, mask_path if mask_path.exists() else None
+        if not mask_path.exists():
+            raise FileNotFoundError(f"Cityscapes label not found: {mask_path}")
+        return image_path, mask_path
 
     def _build_index(self):
         if self.list_file:
@@ -118,7 +124,18 @@ class CityscapesDataset(Dataset):
         if not img_root.exists():
             img_root = self.root / "leftImg8bit"
         if not img_root.exists():
-            raise FileNotFoundError(f"Could not find Cityscapes images under {self.root}")
+            gt_root = self.root / "gtFine" / self.split
+            if not gt_root.exists():
+                raise FileNotFoundError(f"Could not find Cityscapes images or gtFine labels under {self.root}")
+            samples = []
+            for mask_path in sorted(gt_root.rglob("*_gtFine_labelIds.png")):
+                image_path = mask_path.with_name(mask_path.name.replace("_gtFine_labelIds.png", "_gtFine_color.png"))
+                if not image_path.exists():
+                    image_path = mask_path
+                samples.append((image_path, mask_path))
+            if not samples:
+                raise FileNotFoundError(f"No Cityscapes gtFine labelIds found under {gt_root}")
+            return samples
 
         samples = []
         for image_path in sorted(img_root.rglob("*_leftImg8bit.png")):
@@ -126,7 +143,7 @@ class CityscapesDataset(Dataset):
             base = image_path.name.replace("_leftImg8bit.png", "")
             mask_path = self.root / "gtFine" / self.split / city / f"{base}_gtFine_labelIds.png"
             if not mask_path.exists():
-                mask_path = None
+                raise FileNotFoundError(f"Cityscapes label not found: {mask_path}")
             samples.append((image_path, mask_path))
         if not samples:
             raise FileNotFoundError(f"No Cityscapes samples found under {img_root}")
@@ -137,14 +154,13 @@ class CityscapesDataset(Dataset):
 
     def __getitem__(self, idx):
         image_path, mask_path = self.samples[idx]
+        if mask_path is None or not mask_path.exists():
+            raise FileNotFoundError(f"Cityscapes label not found for image: {image_path}")
         image = Image.open(image_path).convert("RGB")
         orig_size = image.size[::-1]
-        if mask_path is None:
-            mask = Image.fromarray(np.full(orig_size, 255, dtype=np.uint8), mode="L")
-        else:
-            label_ids = np.array(Image.open(mask_path))
-            mask_ids = cityscapes_label_ids_to_train_ids(label_ids)
-            mask = Image.fromarray(mask_ids.astype(np.uint8), mode="L")
+        label_ids = np.array(Image.open(mask_path))
+        mask_ids = cityscapes_label_ids_to_train_ids(label_ids)
+        mask = Image.fromarray(mask_ids.astype(np.uint8), mode="L")
 
         sample = {
             "image": image,

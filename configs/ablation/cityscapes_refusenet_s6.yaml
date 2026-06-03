@@ -5,7 +5,7 @@ experiment:
 
 dataset:
   name: cityscapes
-  root: /path/to/Cityscapes
+  root: data/Cityscapes
   num_classes: 19
   ignore_index: 255
   train_split: train
@@ -14,7 +14,11 @@ dataset:
   train_list: null
   val_list: null
   test_list: null
-  crop_size: [512, 1024]
+  crop_size: [1024, 1024]
+  random_resize:
+    scale: [2048, 1024]
+    ratio_range: [0.5, 2.0]
+    keep_ratio: true
   mean: [0.485, 0.456, 0.406]
   std: [0.229, 0.224, 0.225]
 
@@ -23,7 +27,7 @@ model:
   setting: S6
   sam:
     model_type: vit_b
-    checkpoint: /path/to/sam_vit_b.pth
+    checkpoint: ${SAM_VIT_B_CHECKPOINT}
     train_mode: low_lr_ft
     intermediate_blocks: [3, 6, 9, 12]
   decoder:
@@ -31,7 +35,7 @@ model:
     dim: 128
     feature_mode: dualdpt
     fusion_mode: dualdpt
-    dualdpt_out_channels: [96, 192, 384, 768]
+    reassembly_channels: [96, 192, 384, 768]
   boundary:
     enabled: true
 
@@ -43,7 +47,11 @@ train:
   lr_sam: 1.0e-5
   weight_decay: 0.0001
   amp: true
+  lambda_boundary: 1.0
 
 eval:
   batch_size: 1
+  inference: sliding
+  sliding_crop_size: [1024, 1024]
+  sliding_stride: [768, 768]
   save_predictions: true

@@ -10,3 +10,4 @@ timm
 transformers
 segment-anything
 cityscapesscripts
+wandb

@@ -63,9 +63,9 @@ def _candidate_split_files(root: Path, split: str, list_file=None):
     return candidates
 
 
-def _resolve_camvid_pair(root: Path, token: str):
+def _resolve_camvid_pair(root: Path, token: str, split: str | None = None):
     token_path = Path(token)
-    if token_path.is_absolute() and token_path.exists():
+    if token_path.exists():
         image_path = token_path
     else:
         possible = [
@@ -91,16 +91,28 @@ def _resolve_camvid_pair(root: Path, token: str):
         raise FileNotFoundError(f"Could not resolve CamVid image path for token: {token}")
 
     stem = image_path.stem
-    label_candidates = [
-        image_path.with_name(f"{stem}_L.png"),
-        image_path.with_name(f"{stem}_l.png"),
-        image_path.with_name(f"{stem}_label.png"),
-        image_path.with_name(f"{stem}_labels.png"),
-        image_path.with_name(f"{stem}.png"),
+    label_names = [
+        f"{stem}_L.png",
+        f"{stem}_l.png",
+        f"{stem}_label.png",
+        f"{stem}_labels.png",
+        f"{stem}.png",
     ]
-    for folder in [root, root / "labels", root / "Labels", root / "LabeledApproved_full", root / "labels_color"]:
-        label_candidates.extend([folder / c.name for c in label_candidates])
+    label_candidates = [
+        image_path.with_name(name)
+        for name in label_names
+        if image_path.with_name(name) != image_path
+    ]
+    label_dirs = [root, root / "labels", root / "Labels", root / "LabeledApproved_full", root / "labels_color"]
+    if split is not None:
+        label_dirs.extend([root / split / "labels", root / split / "Labels"])
+    if image_path.parent.name.lower() in {"images", "image"}:
+        label_dirs.extend([image_path.parent.parent / "labels", image_path.parent.parent / "Labels"])
+    for folder in label_dirs:
+        label_candidates.extend([folder / name for name in label_names])
     label_path = next((p for p in label_candidates if p.exists()), None)
+    if label_path is None:
+        raise FileNotFoundError(f"Could not resolve CamVid label path for token: {token}")
     return image_path, label_path
 
 
@@ -130,19 +142,30 @@ class CamVidDataset(Dataset):
                         image_path = self.root / image_path
                     if not label_path.is_absolute():
                         label_path = self.root / label_path
+                    if not image_path.exists():
+                        raise FileNotFoundError(f"CamVid image not found: {image_path}")
+                    if not label_path.exists():
+                        raise FileNotFoundError(f"CamVid label not found: {label_path}")
                     samples.append((image_path, label_path))
                 else:
-                    image_path, label_path = _resolve_camvid_pair(self.root, parts[0])
+                    image_path, label_path = _resolve_camvid_pair(self.root, parts[0], split=self.split)
                     samples.append((image_path, label_path))
             if samples:
                 return samples
 
-        for folder in [self.root / "images", self.root / "Images", self.root / self.split]:
+        folders = []
+        split_image_dir = self.root / self.split / "images"
+        split_image_dir_alt = self.root / self.split / "Images"
+        if split_image_dir.exists() or split_image_dir_alt.exists():
+            folders.extend([split_image_dir, split_image_dir_alt])
+        else:
+            folders.extend([self.root / "images", self.root / "Images", self.root / self.split])
+        for folder in folders:
             if folder.exists():
                 for image_path in sorted(folder.rglob("*")):
                     if image_path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
                         continue
-                    label_path = _resolve_camvid_pair(self.root, image_path.stem)[1]
+                    label_path = _resolve_camvid_pair(self.root, str(image_path), split=self.split)[1]
                     samples.append((image_path, label_path))
         if not samples:
             for image_path in sorted(self.root.rglob("*")):
@@ -150,7 +173,7 @@ class CamVidDataset(Dataset):
                     continue
                 if "_L" in image_path.stem.lower() or "label" in image_path.stem.lower():
                     continue
-                label_path = _resolve_camvid_pair(self.root, image_path.stem)[1]
+                label_path = _resolve_camvid_pair(self.root, str(image_path), split=self.split)[1]
                 samples.append((image_path, label_path))
         if not samples:
             raise FileNotFoundError(f"No CamVid samples found under {self.root}")
@@ -161,18 +184,19 @@ class CamVidDataset(Dataset):
 
     def __getitem__(self, idx):
         image_path, mask_path = self.samples[idx]
+        if mask_path is None or not mask_path.exists():
+            raise FileNotFoundError(f"CamVid label not found for image: {image_path}")
         image = Image.open(image_path).convert("RGB")
         orig_size = image.size[::-1]
-        if mask_path is None or not mask_path.exists():
-            mask = Image.fromarray(np.full(orig_size, 255, dtype=np.uint8), mode="L")
+        mask_img = Image.open(mask_path)
+        mask_arr = np.array(mask_img)
+        if mask_arr.ndim == 3 and mask_arr.shape[-1] == 4:
+            mask_arr = mask_arr[..., :3]
+        if mask_arr.ndim == 3:
+            mask_arr = camvid_rgb_mask_to_ids(mask_arr)
         else:
-            mask_img = Image.open(mask_path)
-            mask_arr = np.array(mask_img)
-            if mask_arr.ndim == 3 and mask_arr.shape[-1] == 4:
-                mask_arr = mask_arr[..., :3]
-            if mask_arr.ndim == 3:
-                mask_arr = camvid_rgb_mask_to_ids(mask_arr)
-            mask = Image.fromarray(mask_arr.astype(np.uint8), mode="L")
+            mask_arr = camvid_rgb_mask_to_ids(mask_arr)
+        mask = Image.fromarray(mask_arr.astype(np.uint8), mode="L")
 
         sample = {
             "image": image,

@@ -43,6 +43,7 @@ class PlainUpsampleDecoder(nn.Module):
 
     def __init__(self, in_channels: int, decoder_dim: int, num_classes: int):
         super().__init__()
+        self.out_channels = decoder_dim
         self.project = nn.Conv2d(in_channels, decoder_dim, kernel_size=1)
         self.block1 = ConvGNAct(decoder_dim, decoder_dim)
         self.block2 = ConvGNAct(decoder_dim, decoder_dim)
@@ -82,6 +83,7 @@ class MultiScaleFusionDecoder(nn.Module):
         super().__init__()
         if fuse_type not in {"sum", "concat"}:
             raise ValueError(f"Unsupported fuse_type: {fuse_type}")
+        self.out_channels = decoder_dim
         self.fuse_type = fuse_type
         self.projections = nn.ModuleList(
             [nn.Conv2d(channels, decoder_dim, kernel_size=1) for channels in in_channels]
@@ -167,26 +169,20 @@ class DPTFusionBlock(nn.Module):
         return self.out_conv(x)
 
 
-class DualDPTBoundaryDecoder(nn.Module):
-    """
-    S6 decoder: DA3-style DualDPT with a PIDNet-style one-channel boundary head.
-
-    The semantic and boundary branches have independent top-down DPT fusion blocks.
-    Boundary supervision is intentionally left to the trainer/loss code.
-    """
+class DPTReassembly(nn.Module):
+    """Shared DA3/DPT-style projection, resize, and adapter stage for 4 SAM features."""
 
     def __init__(
         self,
         in_channels: list[int],
         decoder_dim: int,
-        num_classes: int,
-        out_channels: list[int] | tuple[int, int, int, int] = (96, 192, 384, 768),
+        out_channels: list[int] | tuple[int, int, int, int],
     ):
         super().__init__()
         if len(in_channels) != 4:
-            raise ValueError(f"DualDPTBoundaryDecoder expects 4 input features, got {len(in_channels)}")
+            raise ValueError(f"DPTReassembly expects 4 input features, got {len(in_channels)}")
         if len(out_channels) != 4:
-            raise ValueError(f"decoder.dualdpt_out_channels must have 4 values, got {len(out_channels)}")
+            raise ValueError(f"decoder.reassembly_channels must have 4 values, got {len(out_channels)}")
 
         self.projects = nn.ModuleList(
             [nn.Conv2d(in_ch, out_ch, kernel_size=1) for in_ch, out_ch in zip(in_channels, out_channels)]
@@ -203,16 +199,98 @@ class DualDPTBoundaryDecoder(nn.Module):
             [nn.Conv2d(out_ch, decoder_dim, kernel_size=3, padding=1, bias=False) for out_ch in out_channels]
         )
 
+    def forward(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
+        if len(features) != 4:
+            raise ValueError(f"DPTReassembly expects 4 features, got {len(features)}")
+        resized = []
+        for feature, project, resize in zip(features, self.projects, self.resize_layers):
+            resized.append(resize(project(feature)))
+        return [adapter(feature) for adapter, feature in zip(self.adapters, resized)]
+
+
+class DPTSemanticDecoder(nn.Module):
+    """
+    S4/S5 decoder: shared reassembly plus one semantic DPT top-down fusion branch.
+
+    This intentionally has no boundary branch. Dual-branch boundary decoding is
+    reserved for the S6 DualDPTBoundaryDecoder.
+    """
+
+    def __init__(
+        self,
+        in_channels: list[int],
+        decoder_dim: int,
+        num_classes: int,
+        out_channels: list[int] | tuple[int, int, int, int] = (96, 192, 384, 768),
+    ):
+        super().__init__()
+
+        self.out_channels = decoder_dim // 2
+        self.reassemble = DPTReassembly(in_channels, decoder_dim, out_channels)
+        self.refine4 = DPTFusionBlock(decoder_dim, has_residual=False)
+        self.refine3 = DPTFusionBlock(decoder_dim)
+        self.refine2 = DPTFusionBlock(decoder_dim)
+        self.refine1 = DPTFusionBlock(decoder_dim)
+        self.neck = nn.Sequential(
+            nn.Conv2d(decoder_dim, self.out_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(self.out_channels), self.out_channels),
+            nn.GELU(),
+        )
+        self.sem_head = nn.Conv2d(self.out_channels, num_classes, kernel_size=1)
+
+    def _fuse_semantic(self, features: list[torch.Tensor]) -> torch.Tensor:
+        l1, l2, l3, l4 = features
+        x = self.refine4(l4, size=l3.shape[-2:])
+        x = self.refine3(x, l3, size=l2.shape[-2:])
+        x = self.refine2(x, l2, size=l1.shape[-2:])
+        return self.refine1(x, l1)
+
+    def forward(
+        self,
+        features: list[torch.Tensor],
+        output_size: tuple[int, int],
+        return_features: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        features = self.reassemble(features)
+        semantic_features = self.neck(self._fuse_semantic(features))
+        logits = self.sem_head(semantic_features)
+        logits = F.interpolate(logits, size=output_size, mode="bilinear", align_corners=False)
+
+        out = {"logits": logits}
+        if return_features:
+            out["decoder_features"] = semantic_features
+        return out
+
+
+class DualDPTBoundaryDecoder(nn.Module):
+    """
+    S6 decoder: DA3-style DualDPT with a PIDNet-style one-channel boundary head.
+
+    The semantic and boundary branches have independent top-down DPT fusion blocks.
+    Boundary supervision is intentionally left to the trainer/loss code.
+    """
+
+    def __init__(
+        self,
+        in_channels: list[int],
+        decoder_dim: int,
+        num_classes: int,
+        out_channels: list[int] | tuple[int, int, int, int] = (96, 192, 384, 768),
+    ):
+        super().__init__()
+
+        self.out_channels = decoder_dim // 2
+        self.reassemble = DPTReassembly(in_channels, decoder_dim, out_channels)
         self.sem_refine4 = DPTFusionBlock(decoder_dim, has_residual=False)
         self.sem_refine3 = DPTFusionBlock(decoder_dim)
         self.sem_refine2 = DPTFusionBlock(decoder_dim)
         self.sem_refine1 = DPTFusionBlock(decoder_dim)
         self.sem_neck = nn.Sequential(
-            nn.Conv2d(decoder_dim, decoder_dim // 2, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(_group_count(decoder_dim // 2), decoder_dim // 2),
+            nn.Conv2d(decoder_dim, self.out_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(self.out_channels), self.out_channels),
             nn.GELU(),
         )
-        self.sem_head = nn.Conv2d(decoder_dim // 2, num_classes, kernel_size=1)
+        self.sem_head = nn.Conv2d(self.out_channels, num_classes, kernel_size=1)
 
         self.boundary_refine4 = DPTFusionBlock(decoder_dim, has_residual=False)
         self.boundary_refine3 = DPTFusionBlock(decoder_dim)
@@ -223,12 +301,6 @@ class DualDPTBoundaryDecoder(nn.Module):
             ConvGNAct(decoder_dim // 2, decoder_dim // 2),
         )
         self.boundary_head = nn.Conv2d(decoder_dim // 2, 1, kernel_size=1)
-
-    def _project_and_resize(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
-        resized = []
-        for feature, project, resize in zip(features, self.projects, self.resize_layers):
-            resized.append(resize(project(feature)))
-        return [adapter(feature) for adapter, feature in zip(self.adapters, resized)]
 
     def _fuse_semantic(self, features: list[torch.Tensor]) -> torch.Tensor:
         l1, l2, l3, l4 = features
@@ -250,10 +322,7 @@ class DualDPTBoundaryDecoder(nn.Module):
         output_size: tuple[int, int],
         return_features: bool = False,
     ) -> dict[str, torch.Tensor]:
-        if len(features) != 4:
-            raise ValueError(f"DualDPTBoundaryDecoder expects 4 features, got {len(features)}")
-
-        features = self._project_and_resize(features)
+        features = self.reassemble(features)
         semantic_features = self.sem_neck(self._fuse_semantic(features))
         boundary_features = self.boundary_neck(self._fuse_boundary(features))
 
@@ -285,7 +354,7 @@ class ConvGRUCell(nn.Module):
 
 
 class GRURefiner(nn.Module):
-    """S4 refinement: RAFT-like iterative hidden-state updates on coarse logits."""
+    """S5 refinement: RAFT-like iterative hidden-state updates on coarse logits."""
 
     def __init__(self, num_classes: int, context_channels: int, hidden_channels: int, iters: int = 3):
         super().__init__()
@@ -316,9 +385,10 @@ class RefuseNet(nn.Module):
 
     S0: frozen SAM image encoder + final feature + plain decoder.
     S1: low-LR SAM fine-tune + final feature + plain decoder.
-    S2: low-LR SAM fine-tune + pseudo 4-scale features from the final feature.
-    S3: low-LR SAM fine-tune + true intermediate SAM ViT block features.
-    S4: S3 plus iterative GRU refinement and optional coarse-logit auxiliary loss.
+    S2: low-LR SAM fine-tune + pseudo 4-scale features + naive multiscale decoder.
+    S3: low-LR SAM fine-tune + true 4-level SAM features + naive multiscale decoder.
+    S4: low-LR SAM fine-tune + true 4-level SAM features + DPT semantic decoder.
+    S5: S4 plus iterative GRU refinement and coarse-logit auxiliary loss.
     S6: DA3-style DualDPT decoder plus a PIDNet-style boundary head.
     """
 
@@ -345,7 +415,12 @@ class RefuseNet(nn.Module):
         },
         "S4": {
             "sam": {"train_mode": "low_lr_ft"},
-            "decoder": {"feature_mode": "multi_level", "fusion_mode": "multiscale"},
+            "decoder": {"feature_mode": "multi_level", "fusion_mode": "dpt"},
+            "refine": {"enabled": False},
+        },
+        "S5": {
+            "sam": {"train_mode": "low_lr_ft"},
+            "decoder": {"feature_mode": "multi_level", "fusion_mode": "dpt"},
             "refine": {"enabled": True, "type": "gru"},
         },
         "S6": {
@@ -373,7 +448,7 @@ class RefuseNet(nn.Module):
             "fusion_mode": "single",
             "pseudo_scales": [4, 8, 16, 32],
             "fuse_type": "sum",
-            "dualdpt_out_channels": [96, 192, 384, 768],
+            "reassembly_channels": [96, 192, 384, 768],
         },
         "refine": {
             "enabled": False,
@@ -417,19 +492,31 @@ class RefuseNet(nn.Module):
             )
         elif self.feature_mode == "multi_level":
             in_channels = [token_channels for _ in self.sam_cfg["intermediate_blocks"]]
-            self.decoder = MultiScaleFusionDecoder(
-                in_channels=in_channels,
-                decoder_dim=decoder_dim,
-                num_classes=self.num_classes,
-                fuse_type=self.decoder_cfg.get("fuse_type", "sum"),
-            )
+            if self.fusion_mode == "multiscale":
+                self.decoder = MultiScaleFusionDecoder(
+                    in_channels=in_channels,
+                    decoder_dim=decoder_dim,
+                    num_classes=self.num_classes,
+                    fuse_type=self.decoder_cfg.get("fuse_type", "sum"),
+                )
+            elif self.fusion_mode == "dpt":
+                self.decoder = DPTSemanticDecoder(
+                    in_channels=in_channels,
+                    decoder_dim=decoder_dim,
+                    num_classes=self.num_classes,
+                    out_channels=self.decoder_cfg["reassembly_channels"],
+                )
+            else:
+                raise ValueError(
+                    "decoder.fusion_mode must be 'multiscale' or 'dpt' when feature_mode is 'multi_level'."
+                )
         elif self.feature_mode == "dualdpt":
             in_channels = [token_channels for _ in self.sam_cfg["intermediate_blocks"]]
             self.decoder = DualDPTBoundaryDecoder(
                 in_channels=in_channels,
                 decoder_dim=decoder_dim,
                 num_classes=self.num_classes,
-                out_channels=self.decoder_cfg.get("dualdpt_out_channels", [96, 192, 384, 768]),
+                out_channels=self.decoder_cfg["reassembly_channels"],
             )
         else:
             raise ValueError(f"Unsupported decoder.feature_mode: {self.feature_mode}")
@@ -440,7 +527,7 @@ class RefuseNet(nn.Module):
                 raise ValueError(f"Unsupported refine.type: {self.refine_cfg.get('type')}")
             self.refiner = GRURefiner(
                 num_classes=self.num_classes,
-                context_channels=decoder_dim,
+                context_channels=int(getattr(self.decoder, "out_channels", decoder_dim)),
                 hidden_channels=decoder_dim,
                 iters=int(self.refine_cfg.get("iters", 3)),
             )
@@ -452,6 +539,7 @@ class RefuseNet(nn.Module):
         if setting not in cls.PRESETS:
             raise ValueError(f"Unknown ReFuseNet setting: {setting}")
         explicit_decoder = model_cfg.get("decoder", {})
+        explicit_feature = isinstance(explicit_decoder, dict) and "feature_mode" in explicit_decoder
         explicit_fusion = isinstance(explicit_decoder, dict) and "fusion_mode" in explicit_decoder
         _deep_update(cfg, deepcopy(cls.PRESETS[setting]))
         _deep_update(cfg, deepcopy(model_cfg))
@@ -471,26 +559,41 @@ class RefuseNet(nn.Module):
         cfg["decoder"]["fusion_mode"] = str(cfg["decoder"]["fusion_mode"]).lower()
         if cfg["sam"]["train_mode"] not in {"frozen", "low_lr_ft"}:
             raise ValueError("sam.train_mode must be 'frozen' or 'low_lr_ft'.")
-        if cfg["decoder"]["feature_mode"] == "final":
-            expected_fusion = "single"
-        elif cfg["decoder"]["feature_mode"] == "dualdpt":
-            expected_fusion = "dualdpt"
-        else:
-            expected_fusion = "multiscale"
-        if not explicit_fusion:
-            cfg["decoder"]["fusion_mode"] = expected_fusion
-        if cfg["decoder"]["fusion_mode"] != expected_fusion:
+        feature_mode = cfg["decoder"]["feature_mode"]
+        fusion_mode = cfg["decoder"]["fusion_mode"]
+        if feature_mode not in {"final", "pseudo_pyramid", "multi_level", "dualdpt"}:
+            raise ValueError(f"Unsupported decoder.feature_mode: {feature_mode}")
+        allowed_fusions = {
+            "final": {"single"},
+            "pseudo_pyramid": {"multiscale"},
+            "multi_level": {"multiscale", "dpt"},
+            "dualdpt": {"dualdpt"},
+        }
+        default_fusion = {
+            "final": "single",
+            "pseudo_pyramid": "multiscale",
+            "multi_level": "multiscale",
+            "dualdpt": "dualdpt",
+        }[feature_mode]
+        if explicit_feature and not explicit_fusion:
+            cfg["decoder"]["fusion_mode"] = default_fusion
+            fusion_mode = default_fusion
+        if fusion_mode not in allowed_fusions[feature_mode]:
             raise ValueError(
                 f"decoder.fusion_mode={cfg['decoder']['fusion_mode']} is incompatible with "
-                f"feature_mode={cfg['decoder']['feature_mode']}; expected {expected_fusion}."
+                f"feature_mode={cfg['decoder']['feature_mode']}; expected one of "
+                f"{sorted(allowed_fusions[feature_mode])}."
             )
         cfg["sam"]["intermediate_blocks"] = [int(block) for block in cfg["sam"]["intermediate_blocks"]]
         cfg["decoder"]["pseudo_scales"] = [int(scale) for scale in cfg["decoder"]["pseudo_scales"]]
-        cfg["decoder"]["dualdpt_out_channels"] = [int(ch) for ch in cfg["decoder"]["dualdpt_out_channels"]]
+        cfg["decoder"]["reassembly_channels"] = [int(ch) for ch in cfg["decoder"]["reassembly_channels"]]
+        if cfg["decoder"]["feature_mode"] in {"multi_level", "dualdpt"}:
+            if len(cfg["sam"]["intermediate_blocks"]) != 4:
+                raise ValueError(f"{cfg['decoder']['fusion_mode']}/DPT requires exactly four sam.intermediate_blocks.")
         if cfg["decoder"]["feature_mode"] == "dualdpt":
             cfg["boundary"]["enabled"] = True
-            if len(cfg["sam"]["intermediate_blocks"]) != 4:
-                raise ValueError("S6/DualDPT requires exactly four sam.intermediate_blocks.")
+        elif bool(cfg["boundary"].get("enabled", False)):
+            raise ValueError("boundary.enabled is only supported when decoder.feature_mode is 'dualdpt'.")
         return cfg
 
     def _build_sam_image_encoder(self) -> nn.Module:
@@ -541,8 +644,43 @@ class RefuseNet(nn.Module):
         return self._infer_final_channels()
 
     def _preprocess(self, x: torch.Tensor) -> torch.Tensor:
+        processed, _ = self._preprocess_with_meta(x)
+        return processed
+
+    def _preprocess_with_meta(self, x: torch.Tensor) -> tuple[torch.Tensor, dict[str, tuple[int, int] | tuple[int, int, int, int]]]:
         image_size = int(self.sam_cfg.get("image_size", 1024))
-        return F.interpolate(x, size=(image_size, image_size), mode="bilinear", align_corners=False)
+        if image_size <= 0:
+            raise ValueError(f"sam.image_size must be positive, got {image_size}")
+        orig_size = (int(x.shape[-2]), int(x.shape[-1]))
+        scale = image_size / max(orig_size)
+        resized_size = (
+            min(image_size, max(1, int(round(orig_size[0] * scale)))),
+            min(image_size, max(1, int(round(orig_size[1] * scale)))),
+        )
+        resized = F.interpolate(x, size=resized_size, mode="bilinear", align_corners=False)
+        pad_h = image_size - resized_size[0]
+        pad_w = image_size - resized_size[1]
+        if pad_h < 0 or pad_w < 0:
+            raise ValueError(
+                f"Internal SAM preprocessing error: resized size {resized_size} exceeds target {image_size}."
+            )
+        processed = F.pad(resized, (0, pad_w, 0, pad_h)) if pad_h or pad_w else resized
+        meta = {
+            "orig_size": orig_size,
+            "resized_size": resized_size,
+            "pad": (0, pad_w, 0, pad_h),
+            "processed_size": (image_size, image_size),
+        }
+        return processed, meta
+
+    @staticmethod
+    def _restore_logits(logits: torch.Tensor, meta: dict[str, tuple[int, int] | tuple[int, int, int, int]]) -> torch.Tensor:
+        resized_size = tuple(meta["resized_size"])  # type: ignore[arg-type]
+        orig_size = tuple(meta["orig_size"])  # type: ignore[arg-type]
+        logits = logits[:, :, : resized_size[0], : resized_size[1]]
+        if logits.shape[-2:] != orig_size:
+            logits = F.interpolate(logits, size=orig_size, mode="bilinear", align_corners=False)
+        return logits
 
     def _run_sam_encoder(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         if self.feature_mode in {"multi_level", "dualdpt"}:
@@ -589,8 +727,8 @@ class RefuseNet(nn.Module):
         return features
 
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor | None | dict[str, Any]]:
-        output_size = images.shape[-2:]
-        sam_input = self._preprocess(images)
+        sam_input, preprocess_meta = self._preprocess_with_meta(images)
+        output_size = tuple(preprocess_meta["processed_size"])  # type: ignore[arg-type]
         with torch.set_grad_enabled(self.train_mode != "frozen" and torch.is_grad_enabled()):
             final_feature, intermediate_features = self._run_sam_encoder(sam_input)
 
@@ -607,18 +745,21 @@ class RefuseNet(nn.Module):
             decoder_inputs = intermediate_features
             decoder_out = self.decoder(decoder_inputs, output_size, return_features=self.debug)
 
-        coarse_logits = decoder_out["logits"]
+        coarse_logits = self._restore_logits(decoder_out["logits"], preprocess_meta)
         logits = coarse_logits
         returned_coarse = None
         if self.refiner is not None:
-            logits = self.refiner(coarse_logits, decoder_out["decoder_features"])
+            logits = self._restore_logits(
+                self.refiner(coarse_logits, decoder_out["decoder_features"]),
+                preprocess_meta,
+            )
             returned_coarse = coarse_logits
 
-        out: dict[str, torch.Tensor | None | dict[str, Any]] = {
-            "logits": logits,
-            "coarse_logits": returned_coarse,
-            "boundary_logits": decoder_out.get("boundary_logits"),
-        }
+        out: dict[str, torch.Tensor | None | dict[str, Any]] = {"logits": logits}
+        if returned_coarse is not None:
+            out["coarse_logits"] = returned_coarse
+        if "boundary_logits" in decoder_out:
+            out["boundary_logits"] = self._restore_logits(decoder_out["boundary_logits"], preprocess_meta)
         if self.debug:
             out["features"] = {
                 "final": final_feature,

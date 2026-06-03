@@ -6,6 +6,8 @@ from .transforms import (
     RandomCrop,
     RandomHorizontalFlip,
     Resize,
+    RandomResize,
+    PhotoMetricDistortion,
     ToTensor,
     build_segmentation_transforms,
 )
@@ -23,6 +25,8 @@ def build_dataset(cfg, split="train"):
         crop_size=crop_size,
         mean=mean,
         std=std,
+        dataset_name=name,
+        random_resize=dataset_cfg.get("random_resize"),
     )
 
     if name == "camvid":
@@ -42,11 +46,13 @@ def build_dataset(cfg, split="train"):
     else:
         raise ValueError(f"Unknown dataset name: {dataset_cfg['name']}")
 
-    overfit_num_samples = dataset_cfg.get("overfit_num_samples")
-    if split == "train" and overfit_num_samples:
+    max_samples = dataset_cfg.get(f"{split}_num_samples")
+    if max_samples is None and split == "train":
+        max_samples = dataset_cfg.get("overfit_num_samples")
+    if max_samples:
         from torch.utils.data import Subset
 
-        dataset = Subset(dataset, list(range(min(len(dataset), int(overfit_num_samples)))))
+        dataset = Subset(dataset, list(range(min(len(dataset), int(max_samples)))))
 
     return dataset
 

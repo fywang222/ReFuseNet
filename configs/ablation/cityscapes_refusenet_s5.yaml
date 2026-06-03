@@ -1,6 +1,6 @@
 experiment:
-  name: cityscapes_refusenet_s4
-  output_dir: outputs/cityscapes_refusenet_s4
+  name: cityscapes_refusenet_s5_dpt_refine
+  output_dir: outputs/cityscapes_refusenet_s5_dpt_refine
   seed: 42
 
 dataset:
@@ -24,7 +24,7 @@ dataset:
 
 model:
   name: ReFuseNet
-  setting: S4
+  setting: S5
   sam:
     model_type: vit_b
     checkpoint: ${SAM_VIT_B_CHECKPOINT}
@@ -37,7 +37,9 @@ model:
     fusion_mode: dpt
     reassembly_channels: [96, 192, 384, 768]
   refine:
-    enabled: false
+    enabled: true
+    type: gru
+    iters: 3
 
 train:
   epochs: 80
@@ -47,6 +49,7 @@ train:
   lr_sam: 1.0e-5
   weight_decay: 0.0001
   amp: true
+  lambda_aux: 0.4
 
 eval:
   batch_size: 1

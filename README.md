@@ -1,350 +1,208 @@
-# RefSeg
+# ReFuseNet
 
-RefSeg 是一个语义分割实验代码库。输入是图像，输出是每个像素的类别 logits；模型内部不做 softmax。训练 loss 由外部模块处理，目前使用 `CrossEntropyLoss(ignore_index=255)`。
+Semantic segmentation experiments for CamVid and Cityscapes. Models return raw per-pixel logits; training uses `CrossEntropyLoss(ignore_index=255)` directly in `tools/train.py`.
 
-## 环境安装
+## Environment
 
 ```bash
-conda create -n refseg python=3.10 -y
-conda activate refseg
+conda create -n refusenet python=3.10 -y
+conda activate refusenet
 pip install -r requirements.txt
-export CITYSCAPES_DATASET=/path/to/cityscapes
-csCreateTrainIdLabelImgs
 ```
 
-如果使用 SAM / ReFuseNet，需要额外准备 Meta Segment Anything 的 checkpoint，并在 YAML 配置里写明路径。
+For ReFuseNet, download the official Meta Segment Anything SAM ViT-B checkpoint and provide its absolute path through `SAM_VIT_B_CHECKPOINT`.
 
-## 项目目录
+```bash
+export SAM_VIT_B_CHECKPOINT=/absolute/path/to/sam_vit_b.pth
+```
+
+W&B is enabled by default. Install `wandb` from `requirements.txt` and set:
+
+```bash
+export WANDB_API_KEY=your_token_here
+export WANDB_PROJECT=refusenet
+```
+
+Use `--wandb off` if you need to disable W&B for one run.
+
+## Repository Layout
 
 ```text
 .
-├── configs/        # 实验配置。数据路径、模型名、训练参数都在这里改
-├── configs/ablation/
-│   ├── cityscapes_refusenet_s0.yaml
-│   ├── cityscapes_refusenet_s1.yaml
-│   ├── cityscapes_refusenet_s2.yaml
-│   ├── cityscapes_refusenet_s3.yaml
-│   ├── cityscapes_refusenet_s4.yaml
-│   └── cityscapes_refusenet_s6.yaml
-├── datasets/       # 数据集读取、颜色表、数据增强、image/mask 转 tensor
-├── models/         # 模型定义和 build_model 入口
-├── losses/         # loss 构建
-├── utils/          # metric、checkpoint、可视化、logger、随机种子
-├── tools/          # 训练、评估、数据检查、预测可视化入口
-├── scripts/        # 常用实验脚本
+├── configs/        # experiment configs
+├── datasets/       # dataset indexing, label mapping, transforms
+├── models/         # FCN, SegFormer-B5, ReFuseNet
+├── scripts/        # batch training scripts
+├── tools/          # train/eval/check/visualization entry points
+├── utils/          # checkpoints, metrics, logging, visualization
 ├── requirements.txt
 └── README.md
 ```
 
-## 数据集安放位置
+## Data Layout
 
-推荐把数据集放在项目的 `data/` 目录下。也可以放在其他硬盘目录，只要把配置文件里的 `dataset.root` 改成对应路径即可。
-
-推荐结构：
+Current expected local layout:
 
 ```text
 data/
 ├── CamVid/
-│   ├── images/
-│   ├── labels/
-│   └── list/
-│       ├── train.lst
-│       ├── val.lst
-│       └── test.lst
+│   ├── train/
+│   │   ├── images/
+│   │   └── labels/
+│   └── test/
+│       ├── images/
+│       └── labels/
 └── Cityscapes/
-    ├── leftImg8bit/
-    │   ├── train/
-    │   ├── val/
-    │   └── test/
-    ├── gtFine/
-    │   ├── train/
-    │   ├── val/
-    │   └── test/
-    └── list/
-        ├── train.lst
-        ├── val.lst
-        └── test.lst
+    └── gtFine/
+        ├── train/<city>/
+        ├── val/<city>/
+        └── test/<city>/
 ```
 
-CamVid 配置示例：
+CamVid labels may be grayscale class ids or RGB masks. Valid classes are `0..10`; invalid/void ids are mapped to `255`.
 
-```yaml
-dataset:
-  name: camvid
-  root: data/CamVid
-  num_classes: 11
-  ignore_index: 255
-  train_list: list/train.lst
-  val_list: list/val.lst
-  test_list: list/test.lst
-  crop_size: [512, 512]
-```
+Cityscapes uses `*_gtFine_labelIds.png` and maps original labelIds to 19 trainIds. This repo can train from the current `gtFine`-only structure: `*_gtFine_color.png` is used as image input when `leftImg8bit` is absent, while `*_gtFine_labelIds.png` remains the target mask.
 
-Cityscapes 配置示例：
+## Transforms And Evaluation
 
-```yaml
-dataset:
-  name: cityscapes
-  root: data/Cityscapes
-  num_classes: 19
-  ignore_index: 255
-  crop_size: [512, 1024]
-```
-
-`train_list`、`val_list`、`test_list` 是可选字段。它们可以写相对 `dataset.root` 的路径，也可以写绝对路径。
-
-list 文件推荐每行写 image 和 mask 两列：
+CamVid:
 
 ```text
-images/0001.png labels/0001_L.png
-images/0002.png labels/0002_L.png
+train:    Resize(360,480) -> RandomHorizontalFlip(0.5) -> ToTensor -> Normalize
+val/test: Resize(360,480) -> ToTensor -> Normalize
+eval:     whole-image inference
 ```
 
-Cityscapes 也可以写两列：
+Cityscapes:
 
 ```text
-leftImg8bit/train/aachen/aachen_000000_000019_leftImg8bit.png gtFine/train/aachen/aachen_000000_000019_gtFine_labelIds.png
+train:    RandomResize(scale=(2048,1024), ratio_range=(0.5,2.0), keep_ratio=True)
+          -> RandomCrop(1024,1024)
+          -> RandomHorizontalFlip(0.5)
+          -> PhotoMetricDistortion
+          -> ToTensor -> Normalize
+val/test: whole image input, no resize
+eval:     sliding-window inference, crop=1024, stride=768
 ```
 
-如果 Cityscapes list 只写 image 路径，代码会根据标准命名自动推断对应的 `gtFine_labelIds` 标签路径。
+## Models
 
-## Mask 要求
-
-所有 dataset class 返回统一格式：
-
-```python
-{
-    "image": Tensor[3, H, W],
-    "mask": LongTensor[H, W],
-    "name": str,
-    "orig_size": (H0, W0),
-}
-```
-
-`mask` 是类别 id，不是 RGB 图。训练 batch 里的 target mask 形状是 `[B, H, W]`，忽略标签统一是 `255`。
-
-CamVid 的 label mask 通常是 RGB 彩色图，代码会根据 `datasets/color_maps.py` 转成 11 类 class id。不属于颜色表的像素会变成 `255`。
-
-Cityscapes 使用 `gtFine_labelIds.png`，不是 `gtFine_color.png`。代码会把 Cityscapes 原始 `labelId` 转成标准 19 类 `trainId`，不属于 19 类的像素会变成 `255`。
-
-## 模型简介
-
-目前支持的模型：
-
-| 模型 | 配置名 | 简介 |
+| Model | Config key | Notes |
 | --- | --- | --- |
-| FCN-ResNet50 | `model.name: fcn_resnet50` | torchvision FCN baseline，ResNet50 backbone 使用 ImageNet 预训练权重 |
-| SegFormer-B5 | `model.name: segformer_b5` | HuggingFace `nvidia/mit-b5` encoder baseline，用作更强的可比 baseline |
-| SAM baseline | `model.name: sam_vitl_decoder` | 只使用 SAM image encoder，接一个简单分割 decoder |
-| ReFuseNet | `model.name: ReFuseNet` | 本项目主要 ablation 模型，只使用 SAM image encoder 做普通语义分割 |
+| FCN-ResNet50 | `model.name: fcn_resnet50` | Requires torchvision pretrained ResNet50 backbone weights. Failure to load weights raises an error. |
+| SegFormer-B5 | `model.name: segformer_b5` | Requires HuggingFace `nvidia/mit-b5` pretrained weights. Failure to load weights raises an error. |
+| ReFuseNet | `model.name: ReFuseNet` | Uses SAM ViT-B image encoder. `model.sam.checkpoint` is mandatory. |
 
-ReFuseNet 不使用 SAM prompt encoder，不使用 SAM mask decoder，不使用 point / box / text prompt，也不做条件融合、FiLM 或语言融合。它是纯 image-to-logits 的语义分割模型。
+No model silently falls back to random initialization for pretrained backbones.
 
-模型 forward 至少返回：
+## ReFuseNet Roadmap
 
-```python
-{
-    "logits": Tensor[B, num_classes, H, W],
-    "coarse_logits": Tensor[B, num_classes, H, W] | None,
-    "boundary_logits": Tensor[B, 1, H, W] | None,
-}
-```
+ReFuseNet remains a single configurable top-level class. Do not create `ReFuseNetS4`, `ReFuseNetS5`, etc.
 
-S6 会返回 `boundary_logits`，用于外部可选 boundary loss。开启 `model.debug: true` 时，ReFuseNet 会额外返回 `features` 字段用于调试。训练和评估脚本只依赖 `outputs["logits"]`。
+| Setting | Structure |
+| --- | --- |
+| S0 | frozen SAM encoder + final feature + plain decoder |
+| S1 | low-LR SAM fine-tune + final feature + plain decoder |
+| S2 | low-LR SAM fine-tune + pseudo 4-scale features + naive multiscale decoder |
+| S3 | low-LR SAM fine-tune + true 4-level SAM features + naive multiscale decoder |
+| S4 | low-LR SAM fine-tune + true 4-level SAM features + DPT-style semantic decoder |
+| S5 | S4 + GRU-style iterative refinement |
+| S6 | DA3-style Dual-DPT dual-branch boundary decoder, kept in code/config but not run by default scripts |
 
-## ReFuseNet Ablation
-
-ReFuseNet 是单一顶层模型类，所有 ablation 都通过配置控制，不需要创建 `ReFuseNetS0`、`ReFuseNetS1` 这类模型变体。
-
-| 设置 | 目的 | 结构 |
-| --- | --- | --- |
-| S0 | 冻结 SAM encoder 的基础对照 | frozen SAM image encoder + final feature + plain decoder |
-| S1 | 观察低学习率 fine-tune 的收益 | low-LR SAM fine-tune + final feature + plain decoder |
-| S2 | 控制 pyramid decoder 架构影响 | low-LR SAM fine-tune + pseudo 4-scale features + multi-scale decoder |
-| S3 | 观察真实 SAM 中间层特征收益 | low-LR SAM fine-tune + true 4-level SAM features + multi-scale decoder |
-| S4 | 观察 refinement 收益 | S3 + GRU-style iterative refinement |
-| S6 | 观察 DA3 DualDPT 解码和边界监督收益 | low-LR SAM fine-tune + DA3-style DualDPT decoder + PIDNet-style boundary head |
-
-高层配置示例：
+Decoder fields:
 
 ```yaml
-model:
-  name: ReFuseNet
-  setting: S0
+decoder:
+  feature_mode: final | pseudo_pyramid | multi_level | dualdpt
+  fusion_mode: single | multiscale | dpt | dualdpt
+  reassembly_channels: [96, 192, 384, 768]
 ```
 
-显式配置示例：
+Forward outputs:
 
-```yaml
-model:
-  name: ReFuseNet
-  setting: S3
-  sam:
-    model_type: vit_b
-    checkpoint: /path/to/sam_vit_b.pth
-    train_mode: low_lr_ft
-    intermediate_blocks: [3, 6, 9, 12]
-  decoder:
-    num_classes: 19
-    dim: 128
-    feature_mode: multi_level
-    fusion_mode: multiscale
-    pseudo_scales: [4, 8, 16, 32]
-  refine:
-    enabled: false
-    type: gru
-    iters: 3
-```
+- All settings return `logits`.
+- Only `refine.enabled: true` returns `coarse_logits`.
+- Only S6 / `feature_mode: dualdpt` returns `boundary_logits`.
+- `debug: true` adds feature tensors for inspection.
 
-`setting` 会给出默认 preset。如果同时写了 `sam`、`decoder`、`refine` 里的低层字段，显式字段会覆盖 preset 默认值。
+SAM preprocessing inside ReFuseNet:
 
-S4 开启 refinement 后，`logits` 是 refinement 后的结果，`coarse_logits` 是 refinement 前的粗分割结果，可用于可选辅助 loss。
+- resize the input so the longest side becomes 1024
+- keep aspect ratio
+- pad to `1024 x 1024`
+- run the SAM encoder
+- remove the padding from the logits
+- upsample logits back to the input `H x W`
 
-S6 使用四层 SAM 中间特征，按 DA3 `DualDPT` 思路做四尺度投影、重采样和双分支 DPT 融合：主分支输出语义 `logits`，独立辅助分支输出一通道 `boundary_logits`。边界标签生成和 boundary loss 不在模型里做，建议在 trainer/loss 模块中按 PIDNet 类似方式额外监督。
+Training loss:
 
-## 预训练权重
+- `logits` always use `CrossEntropyLoss(ignore_index=255)`
+- S5 adds `lambda_aux * CE(coarse_logits, mask)`
+- S6 adds `lambda_boundary * BCEWithLogits(boundary_logits, boundary_target)`
+- `tools/train.py` calls `model.get_param_groups(cfg)` when available, so `lr_sam` and `lr_decoder` are respected
+- The S5/S6 weights live in `train.lambda_aux` and `train.lambda_boundary`
 
-不同模型的预训练来源不同：
+## Main Training Scripts
 
-| 模型 | 预训练来源 | 是否必须手动下载 |
-| --- | --- | --- |
-| FCN-ResNet50 | torchvision ImageNet ResNet50 backbone 权重 | 否。第一次运行时 torchvision 会自动下载 |
-| SegFormer-B5 | HuggingFace `nvidia/mit-b5` | 否。第一次运行时 transformers 会自动下载 |
-| SAM baseline / ReFuseNet | Meta Segment Anything 官方 checkpoint | 是。需要手动下载并在 YAML 里设置路径 |
-
-ReFuseNet 使用 SAM ViT-B 时：
-
-```yaml
-model:
-  name: ReFuseNet
-  setting: S3
-  sam:
-    model_type: vit_b
-    checkpoint: /absolute/path/to/sam_vit_b.pth
-```
-
-SAM baseline 使用 ViT-L 时：
-
-```yaml
-model:
-  name: sam_vitl_decoder
-  num_classes: 19
-  checkpoint: /absolute/path/to/sam_vit_l.pth
-  freeze_encoder: true
-```
-
-如果 SAM checkpoint 没填，相关模型会直接报错；这是故意的，因为 SAM 权重较大，不适合自动下载。
-
-## 训练
-
-训练 ReFuseNet S0：
+CamVid runs FCN, SegFormer-B5, and ReFuseNet S0 for 200 epochs by default:
 
 ```bash
-python tools/train.py --config configs/ablation/cityscapes_refusenet_s0.yaml
-```
-
-训练 ReFuseNet S3：
-
-```bash
-python tools/train.py --config configs/ablation/cityscapes_refusenet_s3.yaml
-```
-
-训练 ReFuseNet S4：
-
-```bash
-python tools/train.py --config configs/ablation/cityscapes_refusenet_s4.yaml
-```
-
-训练 ReFuseNet S6：
-
-```bash
-python tools/train.py --config configs/ablation/cityscapes_refusenet_s6.yaml
-```
-
-训练 CamVid FCN baseline：
-
-```bash
-python tools/train.py --config configs/camvid_fcn_resnet50.yaml
-```
-
-训练所有 CamVid baselines：
-
-```bash
+export WANDB_API_KEY=your_token_here
+export SAM_VIT_B_CHECKPOINT=/absolute/path/to/sam_vit_b.pth
+export PYTHON=/mnt/shared/miniconda3/envs/refseg/bin/python
 bash scripts/train_camvid_baselines.sh
 ```
 
-训练所有 Cityscapes baselines：
+Cityscapes runs FCN, SegFormer-B5, and ReFuseNet S0-S5 for 200 epochs by default:
 
 ```bash
+export WANDB_API_KEY=your_token_here
+export SAM_VIT_B_CHECKPOINT=/absolute/path/to/sam_vit_b.pth
+export PYTHON=/mnt/shared/miniconda3/envs/refseg/bin/python
 bash scripts/train_cityscapes_baselines.sh
 ```
 
-训练过程会保存：
+Both scripts default to:
+
+```bash
+EPOCHS=200
+SAVE_EPOCHS=50,100,150,200
+DEVICE=cuda
+```
+
+Override them in the shell if needed.
+
+Training evaluates once per epoch. Cityscapes uses `val` by default; CamVid uses `test` by default.
+
+## Single Run
+
+```bash
+python tools/train.py \
+  --config configs/camvid_fcn_resnet50.yaml \
+  --device cuda \
+  --epochs 200 \
+  --save-epochs 50,100,150,200
+```
+
+Checkpoint outputs:
 
 ```text
 outputs/<experiment_name>/
 ├── last.pth
 ├── best.pth
 ├── checkpoints/
-│   └── epoch_0010.pth
+│   └── epoch_0050.pth
 └── run.log
 ```
 
-`last.pth` 是最后一个 epoch。`best.pth` 是 validation mIoU 最好的 checkpoint。所有训练 checkpoint 都包含模型、optimizer 和 AMP scaler 状态。
-
-按固定间隔保存 epoch checkpoint：
+Resume examples:
 
 ```bash
-python tools/train.py \
-  --config configs/camvid_fcn_resnet50.yaml \
-  --save-every 10
+python tools/train.py --config configs/camvid_fcn_resnet50.yaml --resume outputs/camvid_fcn_resnet50/last.pth
+python tools/train.py --config configs/camvid_fcn_resnet50.yaml --resume 50
 ```
 
-只保存指定 epoch：
-
-```bash
-python tools/train.py \
-  --config configs/camvid_fcn_resnet50.yaml \
-  --save-epochs 10,20,40
-```
-
-## 恢复训练和加载预训练
-
-从上次中断处继续训练：
-
-```bash
-python tools/train.py \
-  --config configs/camvid_fcn_resnet50.yaml \
-  --resume outputs/camvid_fcn_resnet50/last.pth
-```
-
-也可以按 epoch 恢复，下面会加载 `outputs/camvid_fcn_resnet50/checkpoints/epoch_0010.pth`：
-
-```bash
-python tools/train.py \
-  --config configs/camvid_fcn_resnet50.yaml \
-  --resume 10
-```
-
-覆盖配置里的总训练 epoch 数：
-
-```bash
-python tools/train.py \
-  --config configs/camvid_fcn_resnet50.yaml \
-  --epochs 120
-```
-
-从另一个 checkpoint 做 shape-matched partial loading：
-
-```bash
-python tools/train.py \
-  --config configs/camvid_fcn_resnet50.yaml \
-  --pretrained outputs/cityscapes_fcn_resnet50/best.pth
-```
-
-`--pretrained` 会只加载名字相同、shape 也相同的 tensor。分类头通常因为类别数不同而被跳过，这正是 Cityscapes 到 CamVid fine-tuning 需要的行为。
-
-## 评估
+## Evaluation
 
 ```bash
 python tools/eval.py \
@@ -353,15 +211,9 @@ python tools/eval.py \
   --save-pred
 ```
 
-评估会打印 mIoU、pixel accuracy、mean accuracy、per-class IoU。CamVid 还会额外统计 rare mIoU：`Pole`、`SignSymbol`、`Pedestrian`、`Bicyclist`。
+Metrics include mIoU, pixel accuracy, mean accuracy, and per-class IoU. CamVid also reports rare mIoU for `Pole`, `SignSymbol`, `Pedestrian`, and `Bicyclist`.
 
-如果加 `--save-pred`，预测图会保存到：
-
-```text
-outputs/<experiment_name>/predictions/<split>/
-```
-
-## 单独保存预测可视化
+## Visualization
 
 ```bash
 python tools/visualize_predictions.py \
@@ -370,17 +222,8 @@ python tools/visualize_predictions.py \
   --num-samples 8
 ```
 
-每个样本会保存：
+## References
 
-- `<name>_image.png`
-- `<name>_gt.png`
-- `<name>_pred.png`
-- `<name>_error.png`
-- `<name>_overlay.png`
-
-## 参考
-
-- HRNet Semantic Segmentation: https://github.com/HRNet/HRNet-Semantic-Segmentation
 - torchvision pretrained weights: https://docs.pytorch.org/vision/stable/models.html
 - SegFormer-B5: https://huggingface.co/nvidia/mit-b5
 - Segment Anything: https://github.com/facebookresearch/segment-anything

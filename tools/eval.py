@@ -41,7 +41,7 @@ def main():
     if args.save_pred:
         save_dir = Path(cfg["experiment"]["output_dir"]) / "predictions" / args.split
 
-    metrics = evaluate_model(model, loader, metric, device, save_dir=save_dir, color_map=get_color_map(cfg))
+    metrics = evaluate_model(model, loader, metric, device, cfg=cfg, save_dir=save_dir, color_map=get_color_map(cfg))
     class_names = dataset.dataset.class_names if hasattr(dataset, "dataset") else dataset.class_names
     logger.info(format_metrics(metrics, class_names))
 

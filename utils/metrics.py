@@ -34,7 +34,7 @@ class SegMetric:
             target = target[None, ...]
 
         for p, t in zip(pred, target):
-            valid = t != self.ignore_index
+            valid = (t != self.ignore_index) & (t >= 0) & (t < self.num_classes) & (p >= 0) & (p < self.num_classes)
             p = p[valid]
             t = t[valid]
             if t.size == 0:
@@ -70,4 +70,3 @@ class SegMetric:
                 rare_iou = ious[rare_ids]
                 result["rare_miou"] = float(rare_iou[rare_valid].mean()) if rare_valid.any() else 0.0
         return result
-
