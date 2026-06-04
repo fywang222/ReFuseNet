@@ -41,6 +41,7 @@ def build_dataset(cfg, split="train"):
             root=dataset_cfg["root"],
             split=dataset_cfg.get(f"{split}_split", split),
             list_file=dataset_cfg.get(f"{split}_list"),
+            label_format=dataset_cfg.get("label_format", "auto"),
             transform=transform,
         )
     else:

@@ -58,7 +58,7 @@ model:
     hidden_dim: 64
     delta_scale: 1.0
 train:
-  epochs: 80
+  epochs: 200
   batch_size: 2
   grad_accum_steps: 4
   num_workers: 8

@@ -29,7 +29,7 @@ model:
   num_classes: 11
   pretrained: true
 train:
-  epochs: 80
+  epochs: 200
   batch_size: 8
   grad_accum_steps: 1
   num_workers: 8

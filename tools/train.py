@@ -33,6 +33,7 @@ def parse_args():
     parser.add_argument("--device", default=None)
     parser.add_argument("--wandb", choices=["on", "off"], default=None)
     parser.add_argument("--s5-debug", action="store_true")
+    parser.add_argument("--eval-overlap-debug", action="store_true")
     return parser.parse_args()
 
 
@@ -112,6 +113,26 @@ def _log_model_summary(logger, model, cfg):
         _format_millions(trainable),
         _format_millions(frozen),
     )
+
+
+def _dataset_sample_preview(dataset, limit: int = 3) -> list[tuple[str, str]]:
+    base_dataset = dataset.dataset if hasattr(dataset, "dataset") else dataset
+    samples = list(getattr(base_dataset, "samples", []))
+    if hasattr(dataset, "indices"):
+        samples = [samples[index] for index in list(dataset.indices)[:limit]]
+    else:
+        samples = samples[:limit]
+    return [(str(image_path), str(mask_path)) for image_path, mask_path in samples]
+
+
+def _log_dataset_summary(logger, split: str, dataset) -> None:
+    logger.info("dataset %s | samples=%d", split, len(dataset))
+    base_dataset = dataset.dataset if hasattr(dataset, "dataset") else dataset
+    if hasattr(base_dataset, "label_format"):
+        logger.info("dataset %s | label_format=%s", split, base_dataset.label_format)
+    for index, (image_path, mask_path) in enumerate(_dataset_sample_preview(dataset), start=1):
+        logger.info("dataset %s preview %d | image=%s | mask=%s", split, index, image_path, mask_path)
+
 
 def _boundary_targets(masks: torch.Tensor, ignore_index: int) -> tuple[torch.Tensor, torch.Tensor]:
     if masks.ndim != 3:
@@ -407,6 +428,8 @@ def main():
     train_dataset, train_loader = build_dataloader(cfg, "train")
     val_dataset, val_loader = build_dataloader(cfg, "val", shuffle=False)
     class_names = train_dataset.dataset.class_names if hasattr(train_dataset, "dataset") else train_dataset.class_names
+    _log_dataset_summary(logger, "train", train_dataset)
+    _log_dataset_summary(logger, "val", val_dataset)
 
     model = build_model(cfg).to(device)
     _log_model_summary(logger, model, cfg)
@@ -639,7 +662,15 @@ def main():
                 logger.info("S5 debug eval deltas | %s", " | ".join(diff_parts))
             else:
                 metric = build_metric(cfg, val_dataset)
-                val_metrics = evaluate_model(model, val_loader, metric, device, cfg=cfg)
+                val_metrics = evaluate_model(
+                    model,
+                    val_loader,
+                    metric,
+                    device,
+                    cfg=cfg,
+                    overlap_debug=args.eval_overlap_debug,
+                    logger=logger,
+                )
             last_metrics = val_metrics
             last_eval_epoch = completed_epoch
             logger.info(
@@ -670,6 +701,10 @@ def main():
             epoch_payload["val/miou"] = val_metrics["miou"]
             epoch_payload["val/pixel_acc"] = val_metrics["pixel_acc"]
             epoch_payload["val/mean_acc"] = val_metrics["mean_acc"]
+            if "valid_pixels" in val_metrics:
+                epoch_payload["val/valid_pixels"] = val_metrics["valid_pixels"]
+            if "correct_pixels" in val_metrics:
+                epoch_payload["val/correct_pixels"] = val_metrics["correct_pixels"]
             if "rare_miou" in val_metrics:
                 epoch_payload["val/rare_miou"] = val_metrics["rare_miou"]
         if debug_metrics is not None:

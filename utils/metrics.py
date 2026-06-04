@@ -61,6 +61,10 @@ class SegMetric:
             "ious": ious.tolist(),
             "pixel_acc": pixel_acc,
             "mean_acc": mean_acc,
+            "valid_pixels": int(self.confusion.sum()),
+            "correct_pixels": int(tp.sum()),
+            "gt_pixels": pos_gt.astype(np.int64).tolist(),
+            "pred_pixels": pos_pred.astype(np.int64).tolist(),
         }
 
         if self.class_names is not None and self.rare_class_names:

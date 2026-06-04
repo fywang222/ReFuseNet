@@ -10,10 +10,10 @@ conda activate refusenet
 pip install -r requirements.txt
 ```
 
-For ReFuseNet, download the official Meta Segment Anything SAM ViT-B checkpoint and provide its absolute path through `SAM_VIT_B_CHECKPOINT`.
+For ReFuseNet, download the official Meta Segment Anything SAM ViT-B checkpoint to the path used by the configs:
 
 ```bash
-export SAM_VIT_B_CHECKPOINT=/absolute/path/to/sam_vit_b.pth
+checkpoints/sam_vit_b_01ec64.pth
 ```
 
 W&B is enabled by default. Install `wandb` from `requirements.txt` and set:
@@ -63,7 +63,7 @@ data/
 
 CamVid labels may be grayscale class ids or RGB masks. Valid classes are `0..10`; invalid/void ids are mapped to `255`.
 
-Cityscapes uses original `leftImg8bit` images as inputs and `*_gtFine_labelIds.png` masks as targets, mapping original labelIds to 19 trainIds. `gtFine` color or label files are not used as image-input fallbacks.
+Cityscapes uses original `leftImg8bit` images as inputs and `gtFine` masks as targets. Configs set `dataset.label_format: auto`, so masks are detected as either original `*_gtFine_labelIds.png` files, which are mapped to 19 trainIds, or already-converted trainId masks, which are used directly. `gtFine` color or label files are not used as image-input fallbacks. Training startup logs the dataset size, inferred label format, and the first three image/mask paths for both train and val.
 
 ## Transforms And Evaluation
 
@@ -110,6 +110,7 @@ ReFuseNet remains a single configurable top-level class. Do not create `ReFuseNe
 | S4 | low-LR SAM fine-tune + true 4-level SAM features + DPT-style semantic decoder |
 | S5 | S4 + GRU-style iterative refinement |
 | S6 | DA3-style Dual-DPT dual-branch boundary decoder, kept in code/config but not run by default scripts |
+| S7 | S2 + GRU-style iterative refinement |
 
 Decoder fields:
 
@@ -145,7 +146,7 @@ SAM preprocessing inside ReFuseNet:
 Training loss:
 
 - `logits` always use `CrossEntropyLoss(ignore_index=255)`
-- S5 adds `lambda_aux * CE(coarse_logits, mask)`
+- Refine-enabled settings return coarse/refined logits, but coarse auxiliary loss is not added by default
 - S6 adds `lambda_boundary * BCEWithLogits(boundary_logits, boundary_target)`
 - `--s5-debug` changes only S5 runs: it adds per-refinement auxiliary losses controlled by `lambda_refine_aux`, leaves `lambda_coarse_aux` at `0.0` by default, and prints refinement diagnostics.
 - `tools/train.py` calls `model.get_param_groups(cfg)` when available, so `lr_sam` and `lr_decoder` are respected
@@ -153,28 +154,27 @@ Training loss:
 
 ## Main Training Scripts
 
-CamVid runs FCN, SegFormer-B5, and ReFuseNet S0-S5 for 200 epochs by default:
+CamVid runs FCN, SegFormer-B5, and ReFuseNet S0-S5/S7 for 200 epochs by default:
 
 ```bash
 export WANDB_API_KEY=<wandb_api_key>
-export SAM_VIT_B_CHECKPOINT=/absolute/path/to/sam_vit_b.pth
 export PYTHON=python
 bash scripts/train_camvid_baselines.sh
 ```
 
-Cityscapes runs FCN, SegFormer-B5, and ReFuseNet S0-S5 using each config's `train.epochs` value:
+Cityscapes runs FCN, SegFormer-B5, and ReFuseNet S0-S5/S7 using each config's `train.epochs` value:
 
 ```bash
 export WANDB_API_KEY=<wandb_api_key>
-export SAM_VIT_B_CHECKPOINT=/absolute/path/to/sam_vit_b.pth
 export PYTHON=python
 bash scripts/train_cityscapes_baselines.sh
 ```
 
+All CamVid configs use `train.epochs: 200`; all Cityscapes configs use `train.epochs: 50`.
+
 CamVid script defaults:
 
 ```bash
-EPOCHS=200
 DEVICE=cuda
 GPUS="0 1 2 3"
 ```
@@ -182,6 +182,19 @@ GPUS="0 1 2 3"
 Cityscapes script uses each config's `train.epochs`, defaults to `DEVICE=cuda`, and runs on `GPUS="4 5 6 7"` unless overridden.
 
 All configs save epoch checkpoints every 50 epochs. Training evaluates according to `train.eval_every` unless overridden with `--eval-every`: CamVid uses 10, Cityscapes uses 5. Cityscapes uses `val` by default; CamVid uses `test` by default.
+
+Batch and accumulation defaults:
+
+| Dataset | Model | train batch | grad accumulation |
+| --- | --- | ---: | ---: |
+| Cityscapes | FCN-ResNet50 | 8 | 1 |
+| Cityscapes | SegFormer-B5 | 4 | 2 |
+| Cityscapes | ReFuseNet S0-S7 | 2 | 4 |
+| CamVid | FCN-ResNet50 | 8 | 1 |
+| CamVid | SegFormer-B5 | 4 | 2 |
+| CamVid | ReFuseNet S0-S7 | 2 | 4 |
+
+ReFuseNet S1-S7 fine-tune the SAM encoder with `lr_sam`, so they use much more training memory than S0 even with the same batch size. Cityscapes eval batch size is 4 by default; if OOM happens during evaluation, reduce `eval.batch_size` or override the config.
 
 ## Single Run
 
@@ -198,6 +211,14 @@ S5 debug, evaluating and printing debug metrics every epoch:
 ```bash
 python tools/train.py --config configs/cityscapes/cityscapes_refusenet_s5.yaml --device cuda --s5-debug --eval-every 1
 ```
+
+Cityscapes sliding-window overlap sanity check:
+
+```bash
+python tools/train.py --config configs/cityscapes/cityscapes_segformer_b5.yaml --device cuda --eval-overlap-debug
+```
+
+`--eval-overlap-debug` compares whole-image and sliding-window predictions on the first eval batch and prints `whole_mIoU`, `sliding_mIoU`, and `pred_diff_ratio`.
 
 Checkpoint outputs:
 

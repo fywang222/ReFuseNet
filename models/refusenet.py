@@ -429,6 +429,7 @@ class RefuseNet(nn.Module):
     S4: low-LR SAM fine-tune + true 4-level SAM features + DPT semantic decoder.
     S5: S4 plus iterative GRU refinement and coarse-logit auxiliary loss.
     S6: DA3-style DualDPT decoder plus a PIDNet-style boundary head.
+    S7: S2 plus iterative GRU refinement.
     """
 
     PRESETS: dict[str, dict[str, Any]] = {
@@ -467,6 +468,11 @@ class RefuseNet(nn.Module):
             "decoder": {"feature_mode": "dualdpt", "fusion_mode": "dualdpt"},
             "refine": {"enabled": False},
             "boundary": {"enabled": True},
+        },
+        "S7": {
+            "sam": {"train_mode": "low_lr_ft"},
+            "decoder": {"feature_mode": "pseudo_pyramid", "fusion_mode": "multiscale"},
+            "refine": {"enabled": True, "type": "gru"},
         },
     }
 

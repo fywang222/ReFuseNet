@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import logging
 from typing import Dict, List, Optional
 
 import torch
@@ -84,6 +85,9 @@ def format_metrics(metrics: Dict, class_names: Optional[List[str]] = None):
         f"pixel_acc={metrics['pixel_acc']:.4f}",
         f"mean_acc={metrics['mean_acc']:.4f}",
     ]
+    if "valid_pixels" in metrics and "correct_pixels" in metrics:
+        parts.append(f"valid_pixels={metrics['valid_pixels']}")
+        parts.append(f"correct_pixels={metrics['correct_pixels']}")
     if "rare_miou" in metrics:
         parts.append(f"rare_mIoU={metrics['rare_miou']:.4f}")
     if class_names and "ious" in metrics:
@@ -91,6 +95,19 @@ def format_metrics(metrics: Dict, class_names: Optional[List[str]] = None):
             f"{name}:{iou:.3f}" for name, iou in zip(class_names, metrics["ious"])
         )
         parts.append(per_class)
+    if class_names and "gt_pixels" in metrics and "pred_pixels" in metrics:
+        total_gt = max(int(sum(metrics["gt_pixels"])), 1)
+        total_pred = max(int(sum(metrics["pred_pixels"])), 1)
+
+        def _top_pixels(key, total):
+            ranked = sorted(enumerate(metrics[key]), key=lambda item: item[1], reverse=True)[:5]
+            return ", ".join(
+                f"{class_names[index]}:{count / total:.3f}"
+                for index, count in ranked
+            )
+
+        parts.append(f"gt_top={_top_pixels('gt_pixels', total_gt)}")
+        parts.append(f"pred_top={_top_pixels('pred_pixels', total_pred)}")
     return " | ".join(parts)
 
 
@@ -146,18 +163,77 @@ def sliding_window_logits(model, images, crop_size=(1024, 1024), stride=(768, 76
 
 
 @torch.no_grad()
-def evaluate_model(model, loader, metric, device, cfg=None, save_dir=None, color_map=None):
+def _log_overlap_debug(model, images, masks, metric, crop_size, stride, logger):
+    whole_logits = _forward_logits(model, images)
+    sliding_logits = sliding_window_logits(model, images, crop_size=crop_size, stride=stride)
+    whole_logits = F.interpolate(whole_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+    sliding_logits = F.interpolate(sliding_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+
+    whole_metric = SegMetric(
+        num_classes=metric.num_classes,
+        ignore_index=metric.ignore_index,
+        class_names=metric.class_names,
+        rare_class_names=metric.rare_class_names,
+    )
+    sliding_metric = SegMetric(
+        num_classes=metric.num_classes,
+        ignore_index=metric.ignore_index,
+        class_names=metric.class_names,
+        rare_class_names=metric.rare_class_names,
+    )
+    whole_metric.update(whole_logits, masks)
+    sliding_metric.update(sliding_logits, masks)
+    whole = whole_metric.compute()
+    sliding = sliding_metric.compute()
+
+    whole_pred = whole_logits.argmax(dim=1)
+    sliding_pred = sliding_logits.argmax(dim=1)
+    valid = masks.ne(metric.ignore_index)
+    pred_diff = whole_pred.ne(sliding_pred) & valid
+    pred_diff_ratio = float(pred_diff.sum().item() / valid.sum().clamp_min(1).item())
+    max_logit_abs_diff = float((whole_logits - sliding_logits).abs().max().item())
+    mean_logit_abs_diff = float((whole_logits - sliding_logits).abs().mean().item())
+
+    logger.info(
+        "eval overlap debug | whole_mIoU=%.4f | whole_pixel_acc=%.4f | "
+        "sliding_mIoU=%.4f | sliding_pixel_acc=%.4f | pred_diff_ratio=%.6f | "
+        "max_logit_abs_diff=%.6f | mean_logit_abs_diff=%.6f",
+        whole["miou"],
+        whole["pixel_acc"],
+        sliding["miou"],
+        sliding["pixel_acc"],
+        pred_diff_ratio,
+        max_logit_abs_diff,
+        mean_logit_abs_diff,
+    )
+
+
+@torch.no_grad()
+def evaluate_model(
+    model,
+    loader,
+    metric,
+    device,
+    cfg=None,
+    save_dir=None,
+    color_map=None,
+    overlap_debug=False,
+    logger=None,
+):
     model.eval()
     metric.reset()
     save_dir = Path(save_dir) if save_dir is not None else None
+    logger = logger or logging.getLogger(__name__)
     eval_cfg = (cfg or {}).get("eval", {})
     dataset_name = (cfg or {}).get("dataset", {}).get("name", "").lower()
     inference = eval_cfg.get("inference", "sliding" if dataset_name == "cityscapes" else "whole")
     crop_size = tuple(eval_cfg.get("sliding_crop_size", (1024, 1024)))
     stride = tuple(eval_cfg.get("sliding_stride", (768, 768)))
-    for batch in loader:
+    for batch_index, batch in enumerate(loader):
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
+        if overlap_debug and batch_index == 0 and inference == "sliding":
+            _log_overlap_debug(model, images, masks, metric, crop_size, stride, logger)
         if inference == "sliding":
             logits = sliding_window_logits(model, images, crop_size=crop_size, stride=stride)
         elif inference == "whole":

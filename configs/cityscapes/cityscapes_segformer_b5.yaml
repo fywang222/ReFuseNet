@@ -7,6 +7,7 @@ dataset:
   root: data/Cityscapes
   num_classes: 19
   ignore_index: 255
+  label_format: auto
   train_split: train
   val_split: val
   test_split: val
@@ -38,7 +39,7 @@ model:
   pretrained: true
   checkpoint: nvidia/mit-b5
 train:
-  epochs: 100
+  epochs: 50
   batch_size: 4
   grad_accum_steps: 2
   num_workers: 4

@@ -7,7 +7,6 @@ export SAM_VIT_B_CHECKPOINT="${SAM_VIT_B_CHECKPOINT:-/absolute/path/to/sam_vit_b
 
 PYTHON="${PYTHON:-python}"
 DEVICE="${DEVICE:-cuda}"
-EPOCHS="${EPOCHS:-200}"
 
 if [[ -n "${WANDB_API_KEY}" ]]; then
   wandb login "${WANDB_API_KEY}"
@@ -26,6 +25,7 @@ CONFIGS=(
   "configs/camvid/camvid_refusenet_s3.yaml"
   "configs/camvid/camvid_refusenet_s4.yaml"
   "configs/camvid/camvid_refusenet_s5.yaml"
+  "configs/camvid/camvid_refusenet_s7.yaml"
 )
 
 run_one() {
@@ -39,7 +39,6 @@ run_one() {
   CUDA_VISIBLE_DEVICES="${gpu}" "${PYTHON}" tools/train.py \
     --config "${config}" \
     --device "${DEVICE}" \
-    --epochs "${EPOCHS}" \
     2>&1 | tee "outputs/logs/${name}.console.log"
 }
 

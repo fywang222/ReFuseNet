@@ -23,6 +23,7 @@ def parse_args():
     parser.add_argument("--save-pred", action="store_true")
     parser.add_argument("--split", default="val")
     parser.add_argument("--device", default=None)
+    parser.add_argument("--eval-overlap-debug", action="store_true")
     return parser.parse_args()
 
 
@@ -41,7 +42,17 @@ def main():
     if args.save_pred:
         save_dir = Path(cfg["experiment"]["output_dir"]) / "predictions" / args.split
 
-    metrics = evaluate_model(model, loader, metric, device, cfg=cfg, save_dir=save_dir, color_map=get_color_map(cfg))
+    metrics = evaluate_model(
+        model,
+        loader,
+        metric,
+        device,
+        cfg=cfg,
+        save_dir=save_dir,
+        color_map=get_color_map(cfg),
+        overlap_debug=args.eval_overlap_debug,
+        logger=logger,
+    )
     class_names = dataset.dataset.class_names if hasattr(dataset, "dataset") else dataset.class_names
     logger.info(format_metrics(metrics, class_names))
 

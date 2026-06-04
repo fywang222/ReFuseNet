@@ -7,6 +7,7 @@ dataset:
   root: data/Cityscapes
   num_classes: 19
   ignore_index: 255
+  label_format: auto
   train_split: train
   val_split: val
   test_split: val
@@ -62,7 +63,7 @@ model:
   boundary:
     enabled: true
 train:
-  epochs: 100
+  epochs: 50
   batch_size: 2
   num_workers: 8
   lr_decoder: 0.0001

@@ -38,7 +38,7 @@ model:
     - 256
     - 256
 train:
-  epochs: 80
+  epochs: 200
   batch_size: 2
   grad_accum_steps: 4
   num_workers: 8

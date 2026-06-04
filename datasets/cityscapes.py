@@ -73,12 +73,30 @@ def cityscapes_ids_to_rgb(mask_ids):
 class CityscapesDataset(Dataset):
     class_names = CITYSCAPES_CLASSES
 
-    def __init__(self, root, split="train", transform=None, list_file=None):
+    def __init__(self, root, split="train", transform=None, list_file=None, label_format="auto"):
         self.root = Path(root)
         self.split = split
         self.transform = transform
         self.list_file = list_file
+        self.label_format = label_format
         self.samples = self._build_index()
+        if self.label_format == "auto":
+            self.label_format = self._infer_label_format()
+        if self.label_format not in {"labelIds", "trainIds"}:
+            raise ValueError(
+                "Cityscapes label_format must be 'auto', 'labelIds', or 'trainIds', "
+                f"got {self.label_format!r}."
+            )
+
+    def _infer_label_format(self):
+        for _, mask_path in self.samples[:32]:
+            if "labelTrainIds" in mask_path.name:
+                return "trainIds"
+            label_values = np.array(Image.open(mask_path))
+            unique_values = np.unique(label_values)
+            if np.any(unique_values > 18):
+                return "labelIds"
+        return "trainIds"
 
     def _resolve_from_list(self, line):
         parts = line.split()
@@ -120,14 +138,14 @@ class CityscapesDataset(Dataset):
                 raise FileNotFoundError(f"No Cityscapes samples found in list file: {list_path}")
             return samples
 
-        img_root = self.root / "leftImg8bit" / self.split
-        if not img_root.exists():
-            img_root = self.root / self.split / "leftImg8bit"
-        if not img_root.exists():
-            img_root = self.root / "leftImg8bit"
-        if not img_root.exists():
+        candidates = [
+            self.root / "leftImg8bit" / self.split,
+            self.root / self.split / "leftImg8bit",
+        ]
+        img_root = next((candidate for candidate in candidates if candidate.exists()), None)
+        if img_root is None:
             raise FileNotFoundError(
-                f"Cityscapes leftImg8bit images not found under {self.root}. "
+                f"Cityscapes leftImg8bit images for split '{self.split}' not found under {self.root}. "
                 "Install the original leftImg8bit images; gtFine color/label files are not valid image inputs."
             )
 
@@ -153,7 +171,14 @@ class CityscapesDataset(Dataset):
         image = Image.open(image_path).convert("RGB")
         orig_size = image.size[::-1]
         label_ids = np.array(Image.open(mask_path))
-        mask_ids = cityscapes_label_ids_to_train_ids(label_ids)
+        if self.label_format == "labelIds":
+            mask_ids = cityscapes_label_ids_to_train_ids(label_ids)
+        else:
+            mask_ids = label_ids.astype(np.uint8)
+            invalid = (mask_ids > 18) & (mask_ids != 255)
+            if invalid.any():
+                mask_ids = mask_ids.copy()
+                mask_ids[invalid] = 255
         mask = Image.fromarray(mask_ids.astype(np.uint8), mode="L")
 
         sample = {

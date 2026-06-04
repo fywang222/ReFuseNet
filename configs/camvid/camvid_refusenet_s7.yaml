@@ -1,6 +1,6 @@
 experiment:
-  name: camvid_refusenet_s2
-  output_dir: outputs/camvid_refusenet_s2
+  name: camvid_refusenet_s7_pseudo_refine
+  output_dir: outputs/camvid_refusenet_s7_pseudo_refine
   seed: 42
 dataset:
   name: camvid
@@ -26,10 +26,11 @@ dataset:
   - 0.225
 model:
   name: ReFuseNet
-  setting: S2
+  setting: S7
   sam:
     model_type: vit_b
     checkpoint: checkpoints/sam_vit_b_01ec64.pth
+    train_mode: low_lr_ft
   decoder:
     num_classes: 11
     dim: 128
@@ -42,6 +43,14 @@ model:
     - 8
     - 16
     - 32
+    feature_mode: pseudo_pyramid
+    fusion_mode: multiscale
+  refine:
+    enabled: true
+    type: gru
+    iters: 3
+    hidden_dim: 64
+    delta_scale: 1.0
 train:
   epochs: 200
   batch_size: 2
@@ -57,6 +66,9 @@ train:
   log_every_steps: 10
   eval_every: 10
   save_every: 50
+  lambda_aux: 0.4
+  lambda_refine_aux: 0.1
+  lambda_coarse_aux: 0.0
 eval:
   batch_size: 4
   inference: whole

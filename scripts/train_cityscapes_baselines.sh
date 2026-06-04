@@ -26,6 +26,7 @@ CONFIGS=(
   "configs/cityscapes/cityscapes_refusenet_s3.yaml"
   "configs/cityscapes/cityscapes_refusenet_s4.yaml"
   "configs/cityscapes/cityscapes_refusenet_s5.yaml"
+  "configs/cityscapes/cityscapes_refusenet_s7.yaml"
 )
 
 run_one() {
