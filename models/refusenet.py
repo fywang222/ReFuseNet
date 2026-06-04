@@ -38,8 +38,8 @@ class ConvGNAct(nn.Module):
         return self.block(x)
 
 
-class PlainUpsampleDecoder(nn.Module):
-    """S0/S1 decoder: one final SAM image feature, no pyramid or refinement."""
+class LegacyPlainUpsampleDecoder(nn.Module):
+    """S0 decoder: one final SAM image feature with the legacy private head."""
 
     def __init__(self, in_channels: int, decoder_dim: int, num_classes: int):
         super().__init__()
@@ -70,6 +70,42 @@ class PlainUpsampleDecoder(nn.Module):
         return out
 
 
+class FinalFeatureSemanticDecoder(nn.Module):
+    """S1 decoder: one final SAM image feature to a fixed semantic head grid."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        decoder_dim: int,
+        head_channels: int,
+        head_resolution: tuple[int, int],
+    ):
+        super().__init__()
+        self.out_channels = head_channels
+        self.head_resolution = tuple(head_resolution)
+        self.project = nn.Conv2d(in_channels, decoder_dim, kernel_size=1)
+        self.block1 = ConvGNAct(decoder_dim, decoder_dim)
+        self.block2 = ConvGNAct(decoder_dim, decoder_dim)
+        self.neck = nn.Sequential(
+            ConvGNAct(decoder_dim, decoder_dim),
+            nn.Conv2d(decoder_dim, head_channels, kernel_size=1),
+        )
+
+    def forward(
+        self,
+        feature: torch.Tensor,
+        output_size: tuple[int, int],
+        return_features: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        del output_size, return_features
+        x = self.project(feature)
+        x = self.block1(x)
+        x = F.interpolate(x, size=(128, 128), mode="bilinear", align_corners=False)
+        x = self.block2(x)
+        x = F.interpolate(x, size=self.head_resolution, mode="bilinear", align_corners=False)
+        return {"semantic_features": self.neck(x)}
+
+
 class MultiScaleFusionDecoder(nn.Module):
     """S2/S3 decoder: project same-style feature lists and fuse them at one scale."""
 
@@ -77,13 +113,15 @@ class MultiScaleFusionDecoder(nn.Module):
         self,
         in_channels: list[int],
         decoder_dim: int,
-        num_classes: int,
+        head_channels: int,
+        head_resolution: tuple[int, int],
         fuse_type: str = "sum",
     ):
         super().__init__()
         if fuse_type not in {"sum", "concat"}:
             raise ValueError(f"Unsupported fuse_type: {fuse_type}")
-        self.out_channels = decoder_dim
+        self.out_channels = head_channels
+        self.head_resolution = tuple(head_resolution)
         self.fuse_type = fuse_type
         self.projections = nn.ModuleList(
             [nn.Conv2d(channels, decoder_dim, kernel_size=1) for channels in in_channels]
@@ -93,9 +131,10 @@ class MultiScaleFusionDecoder(nn.Module):
             ConvGNAct(fused_channels, decoder_dim),
             ConvGNAct(decoder_dim, decoder_dim),
         )
-        self.refine1 = ConvGNAct(decoder_dim, decoder_dim)
-        self.refine2 = ConvGNAct(decoder_dim, decoder_dim)
-        self.head = nn.Conv2d(decoder_dim, num_classes, kernel_size=1)
+        self.neck = nn.Sequential(
+            ConvGNAct(decoder_dim, decoder_dim),
+            nn.Conv2d(decoder_dim, head_channels, kernel_size=1),
+        )
 
     def forward(
         self,
@@ -117,16 +156,9 @@ class MultiScaleFusionDecoder(nn.Module):
         else:
             x = torch.cat(projected, dim=1)
         x = self.fuse(x)
-        x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
-        x = self.refine1(x)
-        x = F.interpolate(x, scale_factor=2.0, mode="bilinear", align_corners=False)
-        decoder_features = self.refine2(x)
-        logits = self.head(decoder_features)
-        logits = F.interpolate(logits, size=output_size, mode="bilinear", align_corners=False)
-        out = {"logits": logits}
-        if return_features:
-            out["decoder_features"] = decoder_features
-        return out
+        if x.shape[-2:] != self.head_resolution:
+            x = F.interpolate(x, size=self.head_resolution, mode="bilinear", align_corners=False)
+        return {"semantic_features": self.neck(x)}
 
 
 class DPTResidualConvUnit(nn.Module):
@@ -220,30 +252,32 @@ class DPTSemanticDecoder(nn.Module):
         self,
         in_channels: list[int],
         decoder_dim: int,
-        num_classes: int,
+        head_channels: int,
         out_channels: list[int] | tuple[int, int, int, int] = (96, 192, 384, 768),
+        dpt_head_scale: str = "p1",
     ):
         super().__init__()
 
-        self.out_channels = decoder_dim // 2
+        if dpt_head_scale != "p1":
+            raise ValueError(f"Only decoder.dpt_head_scale='p1' is supported, got {dpt_head_scale}")
+        self.out_channels = head_channels
         self.reassemble = DPTReassembly(in_channels, decoder_dim, out_channels)
         self.refine4 = DPTFusionBlock(decoder_dim, has_residual=False)
         self.refine3 = DPTFusionBlock(decoder_dim)
         self.refine2 = DPTFusionBlock(decoder_dim)
         self.refine1 = DPTFusionBlock(decoder_dim)
         self.neck = nn.Sequential(
-            nn.Conv2d(decoder_dim, self.out_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(_group_count(self.out_channels), self.out_channels),
+            nn.Conv2d(decoder_dim, head_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(head_channels), head_channels),
             nn.GELU(),
         )
-        self.sem_head = nn.Conv2d(self.out_channels, num_classes, kernel_size=1)
 
     def _fuse_semantic(self, features: list[torch.Tensor]) -> torch.Tensor:
         l1, l2, l3, l4 = features
         x = self.refine4(l4, size=l3.shape[-2:])
         x = self.refine3(x, l3, size=l2.shape[-2:])
         x = self.refine2(x, l2, size=l1.shape[-2:])
-        return self.refine1(x, l1)
+        return self.refine1(x, l1, size=l1.shape[-2:])
 
     def forward(
         self,
@@ -251,15 +285,10 @@ class DPTSemanticDecoder(nn.Module):
         output_size: tuple[int, int],
         return_features: bool = False,
     ) -> dict[str, torch.Tensor]:
+        del output_size, return_features
         features = self.reassemble(features)
         semantic_features = self.neck(self._fuse_semantic(features))
-        logits = self.sem_head(semantic_features)
-        logits = F.interpolate(logits, size=output_size, mode="bilinear", align_corners=False)
-
-        out = {"logits": logits}
-        if return_features:
-            out["decoder_features"] = semantic_features
-        return out
+        return {"semantic_features": semantic_features}
 
 
 class DualDPTBoundaryDecoder(nn.Module):
@@ -274,47 +303,49 @@ class DualDPTBoundaryDecoder(nn.Module):
         self,
         in_channels: list[int],
         decoder_dim: int,
-        num_classes: int,
+        head_channels: int,
         out_channels: list[int] | tuple[int, int, int, int] = (96, 192, 384, 768),
+        dpt_head_scale: str = "p1",
     ):
         super().__init__()
 
-        self.out_channels = decoder_dim // 2
+        if dpt_head_scale != "p1":
+            raise ValueError(f"Only decoder.dpt_head_scale='p1' is supported, got {dpt_head_scale}")
+        self.out_channels = head_channels
         self.reassemble = DPTReassembly(in_channels, decoder_dim, out_channels)
         self.sem_refine4 = DPTFusionBlock(decoder_dim, has_residual=False)
         self.sem_refine3 = DPTFusionBlock(decoder_dim)
         self.sem_refine2 = DPTFusionBlock(decoder_dim)
         self.sem_refine1 = DPTFusionBlock(decoder_dim)
         self.sem_neck = nn.Sequential(
-            nn.Conv2d(decoder_dim, self.out_channels, kernel_size=3, padding=1, bias=False),
-            nn.GroupNorm(_group_count(self.out_channels), self.out_channels),
+            nn.Conv2d(decoder_dim, head_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(_group_count(head_channels), head_channels),
             nn.GELU(),
         )
-        self.sem_head = nn.Conv2d(self.out_channels, num_classes, kernel_size=1)
 
         self.boundary_refine4 = DPTFusionBlock(decoder_dim, has_residual=False)
         self.boundary_refine3 = DPTFusionBlock(decoder_dim)
         self.boundary_refine2 = DPTFusionBlock(decoder_dim)
         self.boundary_refine1 = DPTFusionBlock(decoder_dim)
         self.boundary_neck = nn.Sequential(
-            ConvGNAct(decoder_dim, decoder_dim // 2),
-            ConvGNAct(decoder_dim // 2, decoder_dim // 2),
+            ConvGNAct(decoder_dim, head_channels),
+            ConvGNAct(head_channels, head_channels),
         )
-        self.boundary_head = nn.Conv2d(decoder_dim // 2, 1, kernel_size=1)
+        self.boundary_head = nn.Conv2d(head_channels, 1, kernel_size=1)
 
     def _fuse_semantic(self, features: list[torch.Tensor]) -> torch.Tensor:
         l1, l2, l3, l4 = features
         x = self.sem_refine4(l4, size=l3.shape[-2:])
         x = self.sem_refine3(x, l3, size=l2.shape[-2:])
         x = self.sem_refine2(x, l2, size=l1.shape[-2:])
-        return self.sem_refine1(x, l1)
+        return self.sem_refine1(x, l1, size=l1.shape[-2:])
 
     def _fuse_boundary(self, features: list[torch.Tensor]) -> torch.Tensor:
         l1, l2, l3, l4 = features
         x = self.boundary_refine4(l4, size=l3.shape[-2:])
         x = self.boundary_refine3(x, l3, size=l2.shape[-2:])
         x = self.boundary_refine2(x, l2, size=l1.shape[-2:])
-        return self.boundary_refine1(x, l1)
+        return self.boundary_refine1(x, l1, size=l1.shape[-2:])
 
     def forward(
         self,
@@ -322,20 +353,15 @@ class DualDPTBoundaryDecoder(nn.Module):
         output_size: tuple[int, int],
         return_features: bool = False,
     ) -> dict[str, torch.Tensor]:
+        del return_features
         features = self.reassemble(features)
         semantic_features = self.sem_neck(self._fuse_semantic(features))
         boundary_features = self.boundary_neck(self._fuse_boundary(features))
 
-        logits = self.sem_head(semantic_features)
         boundary_logits = self.boundary_head(boundary_features)
-        logits = F.interpolate(logits, size=output_size, mode="bilinear", align_corners=False)
         boundary_logits = F.interpolate(boundary_logits, size=output_size, mode="bilinear", align_corners=False)
 
-        out = {"logits": logits, "boundary_logits": boundary_logits}
-        if return_features:
-            out["decoder_features"] = semantic_features
-            out["boundary_features"] = boundary_features
-        return out
+        return {"semantic_features": semantic_features, "boundary_logits": boundary_logits}
 
 
 class ConvGRUCell(nn.Module):
@@ -354,11 +380,19 @@ class ConvGRUCell(nn.Module):
 
 
 class GRURefiner(nn.Module):
-    """S5 refinement: RAFT-like iterative hidden-state updates on coarse logits."""
+    """S5 refinement: shared iterative hidden-state updates on head-resolution logits."""
 
-    def __init__(self, num_classes: int, context_channels: int, hidden_channels: int, iters: int = 3):
+    def __init__(
+        self,
+        num_classes: int,
+        context_channels: int,
+        hidden_channels: int = 64,
+        iters: int = 3,
+        delta_scale: float = 1.0,
+    ):
         super().__init__()
         self.iters = int(iters)
+        self.delta_scale = float(delta_scale)
         self.logits_to_hidden = nn.Conv2d(num_classes, hidden_channels, kernel_size=3, padding=1)
         self.context_proj = nn.Conv2d(context_channels, hidden_channels, kernel_size=1)
         self.cell = ConvGRUCell(hidden_channels, hidden_channels)
@@ -367,20 +401,21 @@ class GRURefiner(nn.Module):
             nn.Conv2d(hidden_channels, num_classes, kernel_size=1),
         )
 
-    def forward(self, coarse_logits: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        coarse_size = coarse_logits.shape[-2:]
-        context_size = context.shape[-2:]
-        if coarse_size != context_size:
-            coarse_logits = F.interpolate(coarse_logits, size=context_size, mode="bilinear", align_corners=False)
+    def forward(self, coarse_logits: torch.Tensor, context: torch.Tensor) -> list[torch.Tensor]:
+        if coarse_logits.shape[-2:] != context.shape[-2:]:
+            raise ValueError(
+                "GRURefiner expects head-resolution coarse logits and context with matching spatial size, "
+                f"got {tuple(coarse_logits.shape[-2:])} and {tuple(context.shape[-2:])}."
+            )
         h = self.logits_to_hidden(coarse_logits)
         x = self.context_proj(context)
         logits = coarse_logits
+        refined_logits = []
         for _ in range(self.iters):
             h = self.cell(x, h)
-            logits = logits + self.delta_head(h)
-        if logits.shape[-2:] != coarse_size:
-            logits = F.interpolate(logits, size=coarse_size, mode="bilinear", align_corners=False)
-        return logits
+            logits = logits + self.delta_scale * self.delta_head(h)
+            refined_logits.append(logits)
+        return refined_logits
 
 
 class RefuseNet(nn.Module):
@@ -448,16 +483,21 @@ class RefuseNet(nn.Module):
         "decoder": {
             "num_classes": None,
             "dim": 128,
+            "head_channels": 64,
+            "head_resolution": [256, 256],
             "feature_mode": "final",
             "fusion_mode": "single",
             "pseudo_scales": [4, 8, 16, 32],
             "fuse_type": "sum",
             "reassembly_channels": [96, 192, 384, 768],
+            "dpt_head_scale": "p1",
         },
         "refine": {
             "enabled": False,
             "type": "gru",
             "iters": 3,
+            "hidden_dim": 64,
+            "delta_scale": 1.0,
         },
         "boundary": {
             "enabled": False,
@@ -474,6 +514,7 @@ class RefuseNet(nn.Module):
         self.refine_cfg = self.cfg["refine"]
         self.boundary_cfg = self.cfg["boundary"]
         self.num_classes = int(self.decoder_cfg["num_classes"])
+        self.setting = str(self.cfg["setting"]).upper()
         self.train_mode = self.sam_cfg["train_mode"]
         self.feature_mode = self.decoder_cfg["feature_mode"]
         self.fusion_mode = self.decoder_cfg["fusion_mode"]
@@ -484,14 +525,30 @@ class RefuseNet(nn.Module):
         final_channels = self._infer_final_channels()
         token_channels = self._infer_token_channels()
         decoder_dim = int(self.decoder_cfg["dim"])
+        self.head_channels = int(self.decoder_cfg["head_channels"])
+        self.head_resolution = tuple(int(v) for v in self.decoder_cfg["head_resolution"])
+        if len(self.head_resolution) != 2:
+            raise ValueError(f"decoder.head_resolution must have two values, got {self.decoder_cfg['head_resolution']}")
+
+        self.classifier = None if self.setting == "S0" else nn.Conv2d(self.head_channels, self.num_classes, kernel_size=1)
+
         if self.feature_mode == "final":
-            self.decoder = PlainUpsampleDecoder(final_channels, decoder_dim, self.num_classes)
+            if self.setting == "S0":
+                self.decoder = LegacyPlainUpsampleDecoder(final_channels, decoder_dim, self.num_classes)
+            else:
+                self.decoder = FinalFeatureSemanticDecoder(
+                    in_channels=final_channels,
+                    decoder_dim=decoder_dim,
+                    head_channels=self.head_channels,
+                    head_resolution=self.head_resolution,
+                )
         elif self.feature_mode == "pseudo_pyramid":
             in_channels = [final_channels for _ in self.decoder_cfg["pseudo_scales"]]
             self.decoder = MultiScaleFusionDecoder(
                 in_channels=in_channels,
                 decoder_dim=decoder_dim,
-                num_classes=self.num_classes,
+                head_channels=self.head_channels,
+                head_resolution=self.head_resolution,
                 fuse_type=self.decoder_cfg.get("fuse_type", "sum"),
             )
         elif self.feature_mode == "multi_level":
@@ -500,15 +557,17 @@ class RefuseNet(nn.Module):
                 self.decoder = MultiScaleFusionDecoder(
                     in_channels=in_channels,
                     decoder_dim=decoder_dim,
-                    num_classes=self.num_classes,
+                    head_channels=self.head_channels,
+                    head_resolution=self.head_resolution,
                     fuse_type=self.decoder_cfg.get("fuse_type", "sum"),
                 )
             elif self.fusion_mode == "dpt":
                 self.decoder = DPTSemanticDecoder(
                     in_channels=in_channels,
                     decoder_dim=decoder_dim,
-                    num_classes=self.num_classes,
+                    head_channels=self.head_channels,
                     out_channels=self.decoder_cfg["reassembly_channels"],
+                    dpt_head_scale=self.decoder_cfg.get("dpt_head_scale", "p1"),
                 )
             else:
                 raise ValueError(
@@ -519,8 +578,9 @@ class RefuseNet(nn.Module):
             self.decoder = DualDPTBoundaryDecoder(
                 in_channels=in_channels,
                 decoder_dim=decoder_dim,
-                num_classes=self.num_classes,
+                head_channels=self.head_channels,
                 out_channels=self.decoder_cfg["reassembly_channels"],
+                dpt_head_scale=self.decoder_cfg.get("dpt_head_scale", "p1"),
             )
         else:
             raise ValueError(f"Unsupported decoder.feature_mode: {self.feature_mode}")
@@ -531,9 +591,10 @@ class RefuseNet(nn.Module):
                 raise ValueError(f"Unsupported refine.type: {self.refine_cfg.get('type')}")
             self.refiner = GRURefiner(
                 num_classes=self.num_classes,
-                context_channels=int(getattr(self.decoder, "out_channels", decoder_dim)),
-                hidden_channels=decoder_dim,
+                context_channels=self.head_channels,
+                hidden_channels=int(self.refine_cfg.get("hidden_dim", 64)),
                 iters=int(self.refine_cfg.get("iters", 3)),
+                delta_scale=float(self.refine_cfg.get("delta_scale", 1.0)),
             )
 
     @classmethod
@@ -591,6 +652,22 @@ class RefuseNet(nn.Module):
         cfg["sam"]["intermediate_blocks"] = [int(block) for block in cfg["sam"]["intermediate_blocks"]]
         cfg["decoder"]["pseudo_scales"] = [int(scale) for scale in cfg["decoder"]["pseudo_scales"]]
         cfg["decoder"]["reassembly_channels"] = [int(ch) for ch in cfg["decoder"]["reassembly_channels"]]
+        cfg["decoder"]["head_channels"] = int(cfg["decoder"]["head_channels"])
+        cfg["decoder"]["head_resolution"] = [int(v) for v in cfg["decoder"]["head_resolution"]]
+        cfg["decoder"]["dpt_head_scale"] = str(cfg["decoder"].get("dpt_head_scale", "p1")).lower()
+        cfg["refine"]["iters"] = int(cfg["refine"].get("iters", 3))
+        cfg["refine"]["hidden_dim"] = int(cfg["refine"].get("hidden_dim", 64))
+        cfg["refine"]["delta_scale"] = float(cfg["refine"].get("delta_scale", 1.0))
+        if cfg["decoder"]["head_channels"] <= 0:
+            raise ValueError("decoder.head_channels must be positive.")
+        if len(cfg["decoder"]["head_resolution"]) != 2 or any(v <= 0 for v in cfg["decoder"]["head_resolution"]):
+            raise ValueError("decoder.head_resolution must contain two positive integers.")
+        if cfg["decoder"]["dpt_head_scale"] != "p1":
+            raise ValueError("decoder.dpt_head_scale currently supports only 'p1'.")
+        if cfg["refine"]["iters"] < 0:
+            raise ValueError("refine.iters must be non-negative.")
+        if cfg["refine"]["hidden_dim"] <= 0:
+            raise ValueError("refine.hidden_dim must be positive.")
         if cfg["decoder"]["feature_mode"] in {"multi_level", "dualdpt"}:
             if len(cfg["sam"]["intermediate_blocks"]) != 4:
                 raise ValueError(f"{cfg['decoder']['fusion_mode']}/DPT requires exactly four sam.intermediate_blocks.")
@@ -721,14 +798,30 @@ class RefuseNet(nn.Module):
     def _make_pseudo_pyramid(
         self,
         final_feature: torch.Tensor,
-        output_size: tuple[int, int],
     ) -> list[torch.Tensor]:
         features = []
-        height, width = output_size
-        for scale in self.decoder_cfg["pseudo_scales"]:
-            size = (max(1, (height + scale - 1) // scale), max(1, (width + scale - 1) // scale))
+        height, width = self.head_resolution
+        for scale in (1, 2, 4, 8):
+            size = (max(1, height // scale), max(1, width // scale))
             features.append(F.interpolate(final_feature, size=size, mode="bilinear", align_corners=False))
         return features
+
+    def _make_intermediate_pyramid(self, features: list[torch.Tensor]) -> list[torch.Tensor]:
+        height, width = self.head_resolution
+        pyramid = []
+        for feature, scale in zip(features, (1, 2, 4, 8)):
+            size = (max(1, height // scale), max(1, width // scale))
+            pyramid.append(F.interpolate(feature, size=size, mode="bilinear", align_corners=False))
+        return pyramid
+
+    def _assert_head_features(self, semantic_features: torch.Tensor) -> None:
+        expected = (self.head_channels, *self.head_resolution)
+        actual = (semantic_features.shape[1], *semantic_features.shape[-2:])
+        if actual != expected:
+            raise RuntimeError(
+                f"{self.setting} classifier input must be [B,{expected[0]},{expected[1]},{expected[2]}], "
+                f"got [B,{actual[0]},{actual[1]},{actual[2]}]."
+            )
 
     def forward(self, images: torch.Tensor) -> dict[str, torch.Tensor | None | dict[str, Any]]:
         sam_input, preprocess_meta = self._preprocess_with_meta(images)
@@ -740,37 +833,74 @@ class RefuseNet(nn.Module):
             decoder_out = self.decoder(final_feature, output_size, return_features=self.refiner is not None or self.debug)
             decoder_inputs: torch.Tensor | list[torch.Tensor] = final_feature
         elif self.feature_mode == "pseudo_pyramid":
-            decoder_inputs = self._make_pseudo_pyramid(final_feature, output_size)
+            decoder_inputs = self._make_pseudo_pyramid(final_feature)
             decoder_out = self.decoder(decoder_inputs, output_size, return_features=self.refiner is not None or self.debug)
         elif self.feature_mode == "multi_level":
-            decoder_inputs = intermediate_features
+            decoder_inputs = (
+                self._make_intermediate_pyramid(intermediate_features)
+                if self.fusion_mode == "multiscale"
+                else intermediate_features
+            )
             decoder_out = self.decoder(decoder_inputs, output_size, return_features=self.refiner is not None or self.debug)
         else:
             decoder_inputs = intermediate_features
             decoder_out = self.decoder(decoder_inputs, output_size, return_features=self.debug)
 
-        coarse_logits_processed = decoder_out["logits"]
-        logits_processed = coarse_logits_processed
-        returned_coarse = None
-        if self.refiner is not None:
-            logits_processed = self.refiner(
-                coarse_logits_processed,
-                decoder_out["decoder_features"],
-            )
-            returned_coarse = self._restore_logits(coarse_logits_processed, preprocess_meta)
+        if self.setting == "S0":
+            logits = self._restore_logits(decoder_out["logits"], preprocess_meta)
+            out: dict[str, torch.Tensor | None | dict[str, Any]] = {"logits": logits}
+            if self.debug:
+                out["features"] = {
+                    "final": final_feature,
+                    "decoder_inputs": decoder_inputs,
+                    "decoder": decoder_out.get("decoder_features"),
+                }
+            return out
 
-        logits = self._restore_logits(logits_processed, preprocess_meta)
+        semantic_features = decoder_out["semantic_features"]
+        self._assert_head_features(semantic_features)
+        if self.classifier is None:
+            raise RuntimeError(f"{self.setting} requires a shared classifier.")
+        coarse_logits_head = self.classifier(semantic_features)
+
+        returned_coarse = None
+        aux_logits_head: list[torch.Tensor] = []
+        aux_logits_full: list[torch.Tensor] = []
+        logits_head = coarse_logits_head
+        if self.refiner is not None:
+            aux_logits_head = self.refiner(coarse_logits_head, semantic_features)
+            if aux_logits_head:
+                logits_head = aux_logits_head[-1]
+            returned_coarse = self._restore_logits(
+                F.interpolate(coarse_logits_head, size=output_size, mode="bilinear", align_corners=False),
+                preprocess_meta,
+            )
+            aux_logits_full = [
+                self._restore_logits(
+                    F.interpolate(aux_head, size=output_size, mode="bilinear", align_corners=False),
+                    preprocess_meta,
+                )
+                for aux_head in aux_logits_head
+            ]
+
+        logits = self._restore_logits(
+            F.interpolate(logits_head, size=output_size, mode="bilinear", align_corners=False),
+            preprocess_meta,
+        )
 
         out: dict[str, torch.Tensor | None | dict[str, Any]] = {"logits": logits}
         if returned_coarse is not None:
             out["coarse_logits"] = returned_coarse
+            out["aux_logits"] = aux_logits_full
+            out["coarse_logits_head"] = coarse_logits_head
+            out["aux_logits_head"] = aux_logits_head
         if "boundary_logits" in decoder_out:
             out["boundary_logits"] = self._restore_logits(decoder_out["boundary_logits"], preprocess_meta)
         if self.debug:
             out["features"] = {
                 "final": final_feature,
                 "decoder_inputs": decoder_inputs,
-                "decoder": decoder_out.get("decoder_features"),
+                "decoder": semantic_features,
                 "boundary": decoder_out.get("boundary_features"),
             }
         return out
@@ -787,7 +917,7 @@ class RefuseNet(nn.Module):
             groups.append({"params": sam_params, "lr": lr_sam, "weight_decay": weight_decay, "name": "sam_image_encoder"})
 
         decoder_params = []
-        for module in (self.decoder, self.refiner):
+        for module in (self.decoder, self.refiner, self.classifier):
             if module is not None:
                 decoder_params.extend(param for param in module.parameters() if param.requires_grad)
         groups.append({"params": decoder_params, "lr": lr_decoder, "weight_decay": weight_decay, "name": "decoder"})

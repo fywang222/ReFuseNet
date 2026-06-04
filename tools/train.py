@@ -32,6 +32,7 @@ def parse_args():
     parser.add_argument("--log-every-steps", type=int, default=None)
     parser.add_argument("--device", default=None)
     parser.add_argument("--wandb", choices=["on", "off"], default=None)
+    parser.add_argument("--s5-debug", action="store_true")
     return parser.parse_args()
 
 
@@ -159,6 +160,91 @@ def _compute_total_loss(cfg: dict[str, Any], outputs: dict[str, torch.Tensor], m
     return total, parts
 
 
+def _resize_logits_to_masks(logits: torch.Tensor, masks: torch.Tensor) -> torch.Tensor:
+    if logits.shape[-2:] != masks.shape[-2:]:
+        logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+    return logits
+
+
+def _compute_s5_debug_loss(cfg: dict[str, Any], outputs: dict[str, Any], masks: torch.Tensor, criterion):
+    total = criterion(_resize_logits_to_masks(outputs["logits"], masks), masks)
+    parts: dict[str, torch.Tensor] = {"primary": total}
+
+    refine_weight = float(cfg["train"].get("lambda_refine_aux", 0.1))
+    refined_logits = outputs.get("aux_logits", []) or []
+    coarse_logits = outputs.get("coarse_logits")
+    supervised_aux = ([coarse_logits] if coarse_logits is not None else []) + list(refined_logits[:-1])
+    for index, aux in enumerate(supervised_aux, start=1):
+        aux_loss = criterion(_resize_logits_to_masks(aux, masks), masks)
+        total = total + refine_weight * aux_loss
+        parts[f"refine_aux_{index}"] = aux_loss
+
+    previous = coarse_logits
+    for index, aux in enumerate(refined_logits, start=1):
+        if previous is not None:
+            parts[f"refine_delta_abs_{index}"] = (aux.detach() - previous.detach()).abs().mean()
+        previous = aux
+
+    coarse_weight = float(cfg["train"].get("lambda_coarse_aux", 0.0))
+    if coarse_weight > 0.0 and coarse_logits is not None:
+        coarse_loss = criterion(_resize_logits_to_masks(coarse_logits, masks), masks)
+        total = total + coarse_weight * coarse_loss
+        parts["coarse_aux"] = coarse_loss
+    if coarse_logits is not None:
+        parts["final_vs_coarse_delta_abs"] = (
+            outputs["logits"].detach() - coarse_logits.detach()
+        ).abs().mean()
+
+    parts["total"] = total
+    return total, parts
+
+
+def _is_s5_debug_enabled(args, cfg: dict[str, Any]) -> bool:
+    setting = str(cfg.get("model", {}).get("setting", "")).upper()
+    return bool(args.s5_debug and setting == "S5")
+
+
+def _module_param_count(module) -> tuple[int, int]:
+    if module is None:
+        return 0, 0
+    total = sum(param.numel() for param in module.parameters())
+    trainable = sum(param.numel() for param in module.parameters() if param.requires_grad)
+    return total, trainable
+
+
+def _log_s5_debug_param_summary(logger, model):
+    decoder_total, decoder_trainable = _module_param_count(getattr(model, "decoder", None))
+    refiner_total, refiner_trainable = _module_param_count(getattr(model, "refiner", None))
+    classifier_total, classifier_trainable = _module_param_count(getattr(model, "classifier", None))
+    logger.info("decoder params total=%s trainable=%s", _format_millions(decoder_total), _format_millions(decoder_trainable))
+    logger.info(
+        "refiner params total/trainable=%s/%s",
+        _format_millions(refiner_total),
+        _format_millions(refiner_trainable),
+    )
+    logger.info(
+        "classifier params total=%s trainable=%s",
+        _format_millions(classifier_total),
+        _format_millions(classifier_trainable),
+    )
+
+
+def _refiner_grad_stats(model, grad_scale: float = 1.0) -> tuple[float, int]:
+    refiner = getattr(model, "refiner", None)
+    if refiner is None:
+        return 0.0, 0
+    sq_sum = 0.0
+    tensors = 0
+    grad_scale = max(float(grad_scale), 1.0)
+    for param in refiner.parameters():
+        if param.grad is None:
+            continue
+        tensors += 1
+        grad = param.grad.detach().float() / grad_scale
+        sq_sum += float(grad.pow(2).sum().item())
+    return sq_sum ** 0.5, tensors
+
+
 def _wandb_enabled(cfg: dict[str, Any], arg_value: str | None) -> bool:
     if arg_value is not None:
         return arg_value == "on"
@@ -197,9 +283,118 @@ def _log_wandb(
     wandb_module.log(payload, step=step)
 
 
+@torch.no_grad()
+def _forward_s5_debug_outputs(model, images):
+    outputs = model(images)
+    if not isinstance(outputs, dict) or "logits" not in outputs:
+        raise TypeError("Model forward must return a dict with a 'logits' tensor.")
+    return outputs
+
+
+@torch.no_grad()
+def _sliding_window_s5_debug_outputs(model, images, crop_size=(1024, 1024), stride=(768, 768)):
+    crop_h, crop_w = crop_size
+    stride_h, stride_w = stride
+    batch, _, height, width = images.shape
+    count = images.new_zeros((batch, 1, height, width))
+    sums: dict[str, Any] | None = None
+
+    h_starts = list(range(0, max(height - crop_h, 0) + 1, stride_h))
+    w_starts = list(range(0, max(width - crop_w, 0) + 1, stride_w))
+    if not h_starts or h_starts[-1] != max(height - crop_h, 0):
+        h_starts.append(max(height - crop_h, 0))
+    if not w_starts or w_starts[-1] != max(width - crop_w, 0):
+        w_starts.append(max(width - crop_w, 0))
+
+    for top in h_starts:
+        for left in w_starts:
+            bottom = min(top + crop_h, height)
+            right = min(left + crop_w, width)
+            crop = images[:, :, top:bottom, left:right]
+            pad_h = crop_h - crop.shape[-2]
+            pad_w = crop_w - crop.shape[-1]
+            if pad_h > 0 or pad_w > 0:
+                crop = F.pad(crop, (0, pad_w, 0, pad_h))
+
+            crop_outputs = _forward_s5_debug_outputs(model, crop)
+            crop_logits = crop_outputs["logits"][:, :, : bottom - top, : right - left]
+            crop_coarse = crop_outputs["coarse_logits"][:, :, : bottom - top, : right - left]
+            crop_aux = [
+                aux[:, :, : bottom - top, : right - left]
+                for aux in crop_outputs.get("aux_logits", [])
+            ]
+
+            if sums is None:
+                num_classes = crop_logits.shape[1]
+                sums = {
+                    "logits": images.new_zeros((batch, num_classes, height, width)),
+                    "coarse_logits": images.new_zeros((batch, num_classes, height, width)),
+                    "aux_logits": [
+                        images.new_zeros((batch, num_classes, height, width))
+                        for _ in crop_aux
+                    ],
+                }
+
+            sums["logits"][:, :, top:bottom, left:right] += crop_logits
+            sums["coarse_logits"][:, :, top:bottom, left:right] += crop_coarse
+            for index, aux in enumerate(crop_aux):
+                sums["aux_logits"][index][:, :, top:bottom, left:right] += aux
+            count[:, :, top:bottom, left:right] += 1
+
+    if sums is None:
+        raise RuntimeError("No sliding-window crops were evaluated.")
+    sums["logits"] = sums["logits"] / count.clamp_min(1)
+    sums["coarse_logits"] = sums["coarse_logits"] / count.clamp_min(1)
+    sums["aux_logits"] = [aux / count.clamp_min(1) for aux in sums["aux_logits"]]
+    return sums
+
+
+@torch.no_grad()
+def _evaluate_s5_debug(model, loader, metric_builder, device, cfg):
+    model.eval()
+    eval_cfg = cfg.get("eval", {})
+    dataset_name = cfg.get("dataset", {}).get("name", "").lower()
+    inference = eval_cfg.get("inference", "sliding" if dataset_name == "cityscapes" else "whole")
+    crop_size = tuple(eval_cfg.get("sliding_crop_size", (1024, 1024)))
+    stride = tuple(eval_cfg.get("sliding_stride", (768, 768)))
+
+    final_metric = metric_builder()
+    coarse_metric = metric_builder()
+    aux_metrics = None
+    for batch in loader:
+        images = batch["image"].to(device, non_blocking=True)
+        masks = batch["mask"].to(device, non_blocking=True)
+        if inference == "sliding":
+            outputs = _sliding_window_s5_debug_outputs(model, images, crop_size=crop_size, stride=stride)
+        elif inference == "whole":
+            outputs = _forward_s5_debug_outputs(model, images)
+        else:
+            raise ValueError(f"Unsupported eval.inference: {inference}")
+
+        final_metric.update(_resize_logits_to_masks(outputs["logits"], masks), masks)
+        coarse_metric.update(_resize_logits_to_masks(outputs["coarse_logits"], masks), masks)
+        aux_logits = outputs.get("aux_logits", []) or []
+        if aux_metrics is None:
+            aux_metrics = [metric_builder() for _ in aux_logits]
+        for metric, aux in zip(aux_metrics, aux_logits):
+            metric.update(_resize_logits_to_masks(aux, masks), masks)
+
+    final = final_metric.compute()
+    coarse = coarse_metric.compute()
+    aux_results = [metric.compute() for metric in (aux_metrics or [])]
+    debug_metrics = {
+        "coarse_mIoU": coarse["miou"],
+        "final_mIoU": final["miou"],
+    }
+    for index, result in enumerate(aux_results, start=1):
+        debug_metrics[f"aux_{index}_mIoU"] = result["miou"]
+    return final, debug_metrics
+
+
 def main():
     args = parse_args()
     cfg = load_config(args.config)
+    s5_debug = _is_s5_debug_enabled(args, cfg)
     exp_cfg = cfg["experiment"]
     out_dir = Path(exp_cfg["output_dir"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -215,6 +410,8 @@ def main():
 
     model = build_model(cfg).to(device)
     _log_model_summary(logger, model, cfg)
+    if s5_debug:
+        _log_s5_debug_param_summary(logger, model)
     criterion = build_criterion(cfg).to(device)
     param_groups = model.get_param_groups(cfg) if hasattr(model, "get_param_groups") else model.parameters()
     optimizer = torch.optim.AdamW(
@@ -307,9 +504,17 @@ def main():
 
             with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
                 outputs = model(images)
-                loss, parts = _compute_total_loss(cfg, outputs, masks, criterion)
+                if s5_debug:
+                    loss, parts = _compute_s5_debug_loss(cfg, outputs, masks, criterion)
+                else:
+                    loss, parts = _compute_total_loss(cfg, outputs, masks, criterion)
 
             scaler.scale(loss / accum_denom).backward()
+            refiner_grad_norm = None
+            refiner_grad_tensors = None
+            if s5_debug:
+                grad_scale = scaler.get_scale() if scaler.is_enabled() else 1.0
+                refiner_grad_norm, refiner_grad_tensors = _refiner_grad_stats(model, grad_scale=grad_scale)
             should_step = step % grad_accum_steps == 0 or step == len(train_loader)
             if should_step:
                 scaler.step(optimizer)
@@ -349,6 +554,20 @@ def main():
                     msg += f" aux={aux_value:.4f}"
                 if boundary_value is not None:
                     msg += f" boundary={boundary_value:.4f}"
+                if s5_debug:
+                    for index in range(1, 32):
+                        key = f"refine_aux_{index}"
+                        delta_key = f"refine_delta_abs_{index}"
+                        if key in parts:
+                            msg += f" loss_refine_aux_{index}={float(parts[key].item()):.4f}"
+                        if delta_key in parts:
+                            msg += f" refine_delta_abs_{index}={float(parts[delta_key].item()):.6f}"
+                        if key not in parts and delta_key not in parts:
+                            break
+                    if "final_vs_coarse_delta_abs" in parts:
+                        msg += f" final_vs_coarse_delta_abs={float(parts['final_vs_coarse_delta_abs'].item()):.6f}"
+                    msg += f" refiner_grad_norm={refiner_grad_norm or 0.0:.6f}"
+                    msg += f" refiner_grad_tensors={refiner_grad_tensors or 0}"
                 logger.info(msg)
 
                 wandb_payload = {
@@ -361,6 +580,20 @@ def main():
                     wandb_payload["train/step_aux_loss"] = aux_value
                 if boundary_value is not None:
                     wandb_payload["train/step_boundary_loss"] = boundary_value
+                if s5_debug:
+                    for index in range(1, 32):
+                        key = f"refine_aux_{index}"
+                        delta_key = f"refine_delta_abs_{index}"
+                        if key in parts:
+                            wandb_payload[f"train/loss_refine_aux_{index}"] = float(parts[key].item())
+                        if delta_key in parts:
+                            wandb_payload[f"train/refine_delta_abs_{index}"] = float(parts[delta_key].item())
+                        if key not in parts and delta_key not in parts:
+                            break
+                    if "final_vs_coarse_delta_abs" in parts:
+                        wandb_payload["train/final_vs_coarse_delta_abs"] = float(parts["final_vs_coarse_delta_abs"].item())
+                    wandb_payload["train/refiner_grad_norm"] = refiner_grad_norm or 0.0
+                    wandb_payload["train/refiner_grad_tensors"] = refiner_grad_tensors or 0
                 _log_wandb(wandb_module, global_step, wandb_payload)
 
         num_batches = max(len(train_loader), 1)
@@ -379,9 +612,34 @@ def main():
             loss_msg += f" | train_boundary={train_boundary_loss:.4f}"
 
         val_metrics = None
+        debug_metrics = None
         if do_eval:
-            metric = build_metric(cfg, val_dataset)
-            val_metrics = evaluate_model(model, val_loader, metric, device, cfg=cfg)
+            if s5_debug:
+                metric_builder = lambda: build_metric(cfg, val_dataset)
+                val_metrics, debug_metrics = _evaluate_s5_debug(model, val_loader, metric_builder, device, cfg)
+                logger.info(
+                    "S5 debug eval | coarse_mIoU=%.4f | %s | final_mIoU=%.4f",
+                    debug_metrics["coarse_mIoU"],
+                    " | ".join(
+                        f"aux_{index}_mIoU={debug_metrics[f'aux_{index}_mIoU']:.4f}"
+                        for index in range(1, len([key for key in debug_metrics if key.startswith("aux_")]) + 1)
+                    ),
+                    debug_metrics["final_mIoU"],
+                )
+                prev_miou = debug_metrics["coarse_mIoU"]
+                diff_parts = [f"final - coarse={debug_metrics['final_mIoU'] - debug_metrics['coarse_mIoU']:.4f}"]
+                aux_count = len([key for key in debug_metrics if key.startswith("aux_")])
+                for index in range(1, aux_count + 1):
+                    aux_miou = debug_metrics[f"aux_{index}_mIoU"]
+                    if index == 1:
+                        diff_parts.append(f"aux_1 - coarse={aux_miou - debug_metrics['coarse_mIoU']:.4f}")
+                    else:
+                        diff_parts.append(f"aux_{index} - aux_{index - 1}={aux_miou - prev_miou:.4f}")
+                    prev_miou = aux_miou
+                logger.info("S5 debug eval deltas | %s", " | ".join(diff_parts))
+            else:
+                metric = build_metric(cfg, val_dataset)
+                val_metrics = evaluate_model(model, val_loader, metric, device, cfg=cfg)
             last_metrics = val_metrics
             last_eval_epoch = completed_epoch
             logger.info(
@@ -414,6 +672,9 @@ def main():
             epoch_payload["val/mean_acc"] = val_metrics["mean_acc"]
             if "rare_miou" in val_metrics:
                 epoch_payload["val/rare_miou"] = val_metrics["rare_miou"]
+        if debug_metrics is not None:
+            for key, value in debug_metrics.items():
+                epoch_payload[f"val/{key}"] = value
 
         _log_wandb(wandb_module, global_step, epoch_payload)
 

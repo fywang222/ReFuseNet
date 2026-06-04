@@ -2,7 +2,6 @@ experiment:
   name: cityscapes_refusenet_s2
   output_dir: outputs/cityscapes_refusenet_s2
   seed: 42
-
 dataset:
   name: cityscapes
   root: data/Cityscapes
@@ -14,42 +13,62 @@ dataset:
   train_list: null
   val_list: null
   test_list: null
-  crop_size: [1024, 1024]
+  crop_size:
+  - 1024
+  - 1024
   random_resize:
-    scale: [2048, 1024]
-    ratio_range: [0.5, 2.0]
+    scale:
+    - 2048
+    - 1024
+    ratio_range:
+    - 0.5
+    - 2.0
     keep_ratio: true
-  mean: [0.485, 0.456, 0.406]
-  std: [0.229, 0.224, 0.225]
-
+  mean:
+  - 0.485
+  - 0.456
+  - 0.406
+  std:
+  - 0.229
+  - 0.224
+  - 0.225
 model:
   name: ReFuseNet
   setting: S2
   sam:
     model_type: vit_b
-    checkpoint: ${SAM_VIT_B_CHECKPOINT}
+    checkpoint: checkpoints/sam_vit_b_01ec64.pth
   decoder:
     num_classes: 19
     dim: 128
-    pseudo_scales: [4, 8, 16, 32]
-
+    head_channels: 64
+    head_resolution:
+    - 256
+    - 256
+    pseudo_scales:
+    - 4
+    - 8
+    - 16
+    - 32
 train:
   epochs: 100
   batch_size: 2
   grad_accum_steps: 4
   num_workers: 8
-  lr_decoder: 1.0e-4
-  lr_sam: 1.0e-5
+  lr_decoder: 0.0001
+  lr_sam: 1.0e-05
   weight_decay: 0.0001
   amp: true
-
   log_every_steps: 10
   eval_every: 5
-  save_every: 10
-
+  save_every: 50
 eval:
   batch_size: 4
   inference: sliding
-  sliding_crop_size: [1024, 1024]
-  sliding_stride: [768, 768]
+  sliding_crop_size:
+  - 1024
+  - 1024
+  sliding_stride:
+  - 768
+  - 768
   save_predictions: true

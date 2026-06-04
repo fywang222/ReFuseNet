@@ -159,7 +159,7 @@ class CamVidDataset(Dataset):
         if split_image_dir.exists() or split_image_dir_alt.exists():
             folders.extend([split_image_dir, split_image_dir_alt])
         else:
-            folders.extend([self.root / "images", self.root / "Images", self.root / self.split])
+            folders.extend([self.root / "images", self.root / "Images"])
         for folder in folders:
             if folder.exists():
                 for image_path in sorted(folder.rglob("*")):
@@ -168,15 +168,8 @@ class CamVidDataset(Dataset):
                     label_path = _resolve_camvid_pair(self.root, str(image_path), split=self.split)[1]
                     samples.append((image_path, label_path))
         if not samples:
-            for image_path in sorted(self.root.rglob("*")):
-                if image_path.suffix.lower() not in {".png", ".jpg", ".jpeg"}:
-                    continue
-                if "_L" in image_path.stem.lower() or "label" in image_path.stem.lower():
-                    continue
-                label_path = _resolve_camvid_pair(self.root, str(image_path), split=self.split)[1]
-                samples.append((image_path, label_path))
-        if not samples:
-            raise FileNotFoundError(f"No CamVid samples found under {self.root}")
+            searched = ", ".join(str(folder) for folder in folders)
+            raise FileNotFoundError(f"No CamVid image samples found. Searched explicit image dirs: {searched}")
         return samples
 
     def __len__(self):
