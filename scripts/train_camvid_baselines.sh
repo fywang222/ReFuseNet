@@ -13,24 +13,53 @@ if [[ -n "${WANDB_API_KEY}" ]]; then
   wandb login "${WANDB_API_KEY}"
 fi
 
+GPUS=(${GPUS:-0 1 2 3})
+
 mkdir -p outputs/logs
 
-CUDA_VISIBLE_DEVICES=0 "${PYTHON}" tools/train.py \
-  --config configs/camvid_fcn_resnet50.yaml \
-  --device "${DEVICE}" \
-  --epochs "${EPOCHS}" \
-  2>&1 | tee outputs/logs/camvid_fcn_resnet50.console.log &
+CONFIGS=(
+  "configs/camvid/camvid_fcn_resnet50.yaml"
+  "configs/camvid/camvid_segformer_b5.yaml"
+  "configs/camvid/camvid_refusenet_s0.yaml"
+  "configs/camvid/camvid_refusenet_s1.yaml"
+  "configs/camvid/camvid_refusenet_s2.yaml"
+  "configs/camvid/camvid_refusenet_s3.yaml"
+  "configs/camvid/camvid_refusenet_s4.yaml"
+  "configs/camvid/camvid_refusenet_s5.yaml"
+)
 
-CUDA_VISIBLE_DEVICES=1 "${PYTHON}" tools/train.py \
-  --config configs/camvid_segformer_b5.yaml \
-  --device "${DEVICE}" \
-  --epochs "${EPOCHS}" \
-  2>&1 | tee outputs/logs/camvid_segformer_b5.console.log &
+run_one() {
+  local gpu="$1"
+  local config="$2"
+  local name
+  name="$(basename "${config}" .yaml)"
 
-CUDA_VISIBLE_DEVICES=2 "${PYTHON}" tools/train.py \
-  --config configs/camvid_refusenet_s0.yaml \
-  --device "${DEVICE}" \
-  --epochs "${EPOCHS}" \
-  2>&1 | tee outputs/logs/camvid_refusenet_s0.console.log &
+  echo "[launch] GPU=${gpu} config=${config}"
 
-wait
+  CUDA_VISIBLE_DEVICES="${gpu}" "${PYTHON}" tools/train.py \
+    --config "${config}" \
+    --device "${DEVICE}" \
+    --epochs "${EPOCHS}" \
+    2>&1 | tee "outputs/logs/${name}.console.log"
+}
+
+batch_size="${#GPUS[@]}"
+num_configs="${#CONFIGS[@]}"
+
+for ((start=0; start<num_configs; start+=batch_size)); do
+  echo "========== launching batch starting at index ${start} =========="
+
+  for ((i=0; i<batch_size; i++)); do
+    idx=$((start + i))
+    if (( idx >= num_configs )); then
+      break
+    fi
+
+    run_one "${GPUS[$i]}" "${CONFIGS[$idx]}" &
+  done
+
+  wait
+  echo "========== batch finished =========="
+done
+
+echo "All CamVid jobs finished."

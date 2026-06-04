@@ -249,6 +249,7 @@ def main():
 
         extra = checkpoint.get("extra", {}) if isinstance(checkpoint.get("extra", {}), dict) else {}
         last_eval_epoch = extra.get("last_eval_epoch")
+        resumed_optimizer_step = extra.get("optimizer_step")
 
     epochs = int(args.epochs or cfg["train"]["epochs"])
 
@@ -263,41 +264,58 @@ def main():
     log_every_steps = args.log_every_steps
     if log_every_steps is None:
         log_every_steps = int(cfg["train"].get("log_every_steps", 50) or 0)
+    grad_accum_steps = int(cfg["train"].get("grad_accum_steps", 1) or 1)
+    if grad_accum_steps < 1:
+        raise ValueError(f"train.grad_accum_steps must be >= 1, got {grad_accum_steps}")
 
     epoch_ckpt_dir = out_dir / "checkpoints"
     global_step = start_epoch * len(train_loader)
+    optimizer_step = start_epoch * ((len(train_loader) + grad_accum_steps - 1) // grad_accum_steps)
+    if "resumed_optimizer_step" in locals() and resumed_optimizer_step is not None:
+        optimizer_step = int(resumed_optimizer_step)
 
     logger.info(
-        "schedule | epochs=%d | log_every_steps=%d | eval_every=%d | save_every=%d",
+        "schedule | epochs=%d | log_every_steps=%d | eval_every=%d | save_every=%d | grad_accum_steps=%d",
         epochs,
         log_every_steps,
         eval_every,
         save_every,
+        grad_accum_steps,
     )
 
     for epoch in range(start_epoch, epochs):
         model.train()
+        optimizer.zero_grad(set_to_none=True)
         running_total = 0.0
         running_primary = 0.0
         running_aux = 0.0
         running_boundary = 0.0
         saw_aux = False
         saw_boundary = False
+        remainder_steps = len(train_loader) % grad_accum_steps
 
         for step, batch in enumerate(train_loader, start=1):
             global_step += 1
+            accum_denom = (
+                remainder_steps
+                if remainder_steps and step > len(train_loader) - remainder_steps
+                else grad_accum_steps
+            )
 
             images = batch["image"].to(device, non_blocking=True)
             masks = batch["mask"].to(device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=scaler.is_enabled()):
                 outputs = model(images)
                 loss, parts = _compute_total_loss(cfg, outputs, masks, criterion)
 
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+            scaler.scale(loss / accum_denom).backward()
+            should_step = step % grad_accum_steps == 0 or step == len(train_loader)
+            if should_step:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
+                optimizer_step += 1
 
             total_value = float(parts["total"].item())
             primary_value = float(parts["primary"].item())
@@ -323,6 +341,7 @@ def main():
                     f"epoch {epoch + 1}/{epochs} "
                     f"step {step}/{len(train_loader)} "
                     f"global_step={global_step} "
+                    f"optimizer_step={optimizer_step} "
                     f"loss={total_value:.4f} "
                     f"primary={primary_value:.4f}"
                 )
@@ -335,6 +354,7 @@ def main():
                 wandb_payload = {
                     "train/step_loss": total_value,
                     "train/step_primary_loss": primary_value,
+                    "train/optimizer_step": optimizer_step,
                     "epoch": epoch + 1,
                 }
                 if aux_value is not None:
@@ -401,6 +421,7 @@ def main():
             "config": cfg,
             "train_loss": train_loss,
             "global_step": global_step,
+            "optimizer_step": optimizer_step,
             "last_eval_epoch": last_eval_epoch,
         }
 

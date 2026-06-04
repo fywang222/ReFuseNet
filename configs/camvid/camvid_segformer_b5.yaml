@@ -22,11 +22,12 @@ model:
   name: segformer_b5
   num_classes: 11
   pretrained: true
-  checkpoint: /data/xicheng/ReFuseNet/checkpoints/nvidia_mit-b5
+  checkpoint: nvidia/mit-b5
 
 train:
   epochs: 80
   batch_size: 8
+  grad_accum_steps: 1
   num_workers: 8
   lr: 0.00006
   weight_decay: 0.01

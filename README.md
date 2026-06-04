@@ -19,7 +19,7 @@ export SAM_VIT_B_CHECKPOINT=/absolute/path/to/sam_vit_b.pth
 W&B is enabled by default. Install `wandb` from `requirements.txt` and set:
 
 ```bash
-export WANDB_API_KEY=your_token_here
+export WANDB_API_KEY=<wandb_api_key>
 export WANDB_PROJECT=refusenet
 ```
 
@@ -61,7 +61,7 @@ data/
 
 CamVid labels may be grayscale class ids or RGB masks. Valid classes are `0..10`; invalid/void ids are mapped to `255`.
 
-Cityscapes uses `*_gtFine_labelIds.png` and maps original labelIds to 19 trainIds. This repo can train from the current `gtFine`-only structure: `*_gtFine_color.png` is used as image input when `leftImg8bit` is absent, while `*_gtFine_labelIds.png` remains the target mask.
+Cityscapes uses original `leftImg8bit` images as inputs and `*_gtFine_labelIds.png` masks as targets, mapping original labelIds to 19 trainIds. `gtFine` color or label files are not used as image-input fallbacks.
 
 ## Transforms And Evaluation
 
@@ -144,21 +144,21 @@ Training loss:
 
 ## Main Training Scripts
 
-CamVid runs FCN, SegFormer-B5, and ReFuseNet S0 for 200 epochs by default:
+CamVid runs FCN, SegFormer-B5, and ReFuseNet S0-S5 for 200 epochs by default:
 
 ```bash
-export WANDB_API_KEY=your_token_here
+export WANDB_API_KEY=<wandb_api_key>
 export SAM_VIT_B_CHECKPOINT=/absolute/path/to/sam_vit_b.pth
-export PYTHON=/mnt/shared/miniconda3/envs/refseg/bin/python
+export PYTHON=python
 bash scripts/train_camvid_baselines.sh
 ```
 
 Cityscapes runs FCN, SegFormer-B5, and ReFuseNet S0-S5 for 200 epochs by default:
 
 ```bash
-export WANDB_API_KEY=your_token_here
+export WANDB_API_KEY=<wandb_api_key>
 export SAM_VIT_B_CHECKPOINT=/absolute/path/to/sam_vit_b.pth
-export PYTHON=/mnt/shared/miniconda3/envs/refseg/bin/python
+export PYTHON=python
 bash scripts/train_cityscapes_baselines.sh
 ```
 
@@ -178,7 +178,7 @@ Training evaluates once per epoch. Cityscapes uses `val` by default; CamVid uses
 
 ```bash
 python tools/train.py \
-  --config configs/camvid_fcn_resnet50.yaml \
+  --config configs/camvid/camvid_fcn_resnet50.yaml \
   --device cuda \
   --epochs 200 \
   --save-epochs 50,100,150,200
@@ -198,15 +198,15 @@ outputs/<experiment_name>/
 Resume examples:
 
 ```bash
-python tools/train.py --config configs/camvid_fcn_resnet50.yaml --resume outputs/camvid_fcn_resnet50/last.pth
-python tools/train.py --config configs/camvid_fcn_resnet50.yaml --resume 50
+python tools/train.py --config configs/camvid/camvid_fcn_resnet50.yaml --resume outputs/camvid_fcn_resnet50/last.pth
+python tools/train.py --config configs/camvid/camvid_fcn_resnet50.yaml --resume 50
 ```
 
 ## Evaluation
 
 ```bash
 python tools/eval.py \
-  --config configs/camvid_fcn_resnet50.yaml \
+  --config configs/camvid/camvid_fcn_resnet50.yaml \
   --ckpt outputs/camvid_fcn_resnet50/best.pth \
   --save-pred
 ```
@@ -217,7 +217,7 @@ Metrics include mIoU, pixel accuracy, mean accuracy, and per-class IoU. CamVid a
 
 ```bash
 python tools/visualize_predictions.py \
-  --config configs/camvid_fcn_resnet50.yaml \
+  --config configs/camvid/camvid_fcn_resnet50.yaml \
   --ckpt outputs/camvid_fcn_resnet50/best.pth \
   --num-samples 8
 ```

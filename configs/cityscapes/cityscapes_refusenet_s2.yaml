@@ -1,6 +1,6 @@
 experiment:
-  name: cityscapes_segformer_b5
-  output_dir: outputs/cityscapes_segformer_b5
+  name: cityscapes_refusenet_s2
+  output_dir: outputs/cityscapes_refusenet_s2
   seed: 42
 
 dataset:
@@ -23,23 +23,29 @@ dataset:
   std: [0.229, 0.224, 0.225]
 
 model:
-  name: segformer_b5
-  num_classes: 19
-  pretrained: true
-  checkpoint: /data/xicheng/ReFuseNet/checkpoints/nvidia_mit-b5
+  name: ReFuseNet
+  setting: S2
+  sam:
+    model_type: vit_b
+    checkpoint: ${SAM_VIT_B_CHECKPOINT}
+  decoder:
+    num_classes: 19
+    dim: 128
+    pseudo_scales: [4, 8, 16, 32]
 
 train:
   epochs: 100
-  batch_size: 4
-  num_workers: 4
-  lr: 0.00006
-  weight_decay: 0.01
+  batch_size: 2
+  grad_accum_steps: 4
+  num_workers: 8
+  lr_decoder: 1.0e-4
+  lr_sam: 1.0e-5
+  weight_decay: 0.0001
   amp: true
-  crop_size: [1024, 1024]
 
   log_every_steps: 10
   eval_every: 5
-  save_every: 5
+  save_every: 10
 
 eval:
   batch_size: 4

@@ -97,6 +97,8 @@ class CityscapesDataset(Dataset):
         city = image_path.parent.name
         base = image_path.name.replace("_leftImg8bit.png", "")
         mask_path = self.root / "gtFine" / self.split / city / f"{base}_gtFine_labelIds.png"
+        if not image_path.exists():
+            raise FileNotFoundError(f"Cityscapes image not found: {image_path}")
         if not mask_path.exists():
             raise FileNotFoundError(f"Cityscapes label not found: {mask_path}")
         return image_path, mask_path
@@ -124,18 +126,10 @@ class CityscapesDataset(Dataset):
         if not img_root.exists():
             img_root = self.root / "leftImg8bit"
         if not img_root.exists():
-            gt_root = self.root / "gtFine" / self.split
-            if not gt_root.exists():
-                raise FileNotFoundError(f"Could not find Cityscapes images or gtFine labels under {self.root}")
-            samples = []
-            for mask_path in sorted(gt_root.rglob("*_gtFine_labelIds.png")):
-                image_path = mask_path.with_name(mask_path.name.replace("_gtFine_labelIds.png", "_gtFine_color.png"))
-                if not image_path.exists():
-                    image_path = mask_path
-                samples.append((image_path, mask_path))
-            if not samples:
-                raise FileNotFoundError(f"No Cityscapes gtFine labelIds found under {gt_root}")
-            return samples
+            raise FileNotFoundError(
+                f"Cityscapes leftImg8bit images not found under {self.root}. "
+                "Install the original leftImg8bit images; gtFine color/label files are not valid image inputs."
+            )
 
         samples = []
         for image_path in sorted(img_root.rglob("*_leftImg8bit.png")):

@@ -368,14 +368,18 @@ class GRURefiner(nn.Module):
         )
 
     def forward(self, coarse_logits: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        if context.shape[-2:] != coarse_logits.shape[-2:]:
-            context = F.interpolate(context, size=coarse_logits.shape[-2:], mode="bilinear", align_corners=False)
+        coarse_size = coarse_logits.shape[-2:]
+        context_size = context.shape[-2:]
+        if coarse_size != context_size:
+            coarse_logits = F.interpolate(coarse_logits, size=context_size, mode="bilinear", align_corners=False)
         h = self.logits_to_hidden(coarse_logits)
         x = self.context_proj(context)
         logits = coarse_logits
         for _ in range(self.iters):
             h = self.cell(x, h)
             logits = logits + self.delta_head(h)
+        if logits.shape[-2:] != coarse_size:
+            logits = F.interpolate(logits, size=coarse_size, mode="bilinear", align_corners=False)
         return logits
 
 

@@ -18,14 +18,14 @@ if [[ -n "${WANDB_API_KEY}" ]]; then
 fi
 
 CONFIGS=(
-  "configs/cityscapes_fcn_resnet50.yaml"
-  "configs/cityscapes_segformer_b5.yaml"
-  "configs/ablation/cityscapes_refusenet_s0.yaml"
-  "configs/ablation/cityscapes_refusenet_s1.yaml"
-  "configs/ablation/cityscapes_refusenet_s2.yaml"
-  "configs/ablation/cityscapes_refusenet_s3.yaml"
-  "configs/ablation/cityscapes_refusenet_s4.yaml"
-  "configs/ablation/cityscapes_refusenet_s5.yaml"
+  "configs/cityscapes/cityscapes_fcn_resnet50.yaml"
+  "configs/cityscapes/cityscapes_segformer_b5.yaml"
+  "configs/cityscapes/cityscapes_refusenet_s0.yaml"
+  "configs/cityscapes/cityscapes_refusenet_s1.yaml"
+  "configs/cityscapes/cityscapes_refusenet_s2.yaml"
+  "configs/cityscapes/cityscapes_refusenet_s3.yaml"
+  "configs/cityscapes/cityscapes_refusenet_s4.yaml"
+  "configs/cityscapes/cityscapes_refusenet_s5.yaml"
 )
 
 run_one() {

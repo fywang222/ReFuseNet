@@ -1,6 +1,6 @@
 experiment:
-  name: camvid_refusenet_s0
-  output_dir: outputs/camvid_refusenet_s0
+  name: camvid_refusenet_s1
+  output_dir: outputs/camvid_refusenet_s1
   seed: 42
 
 dataset:
@@ -20,7 +20,7 @@ dataset:
 
 model:
   name: ReFuseNet
-  setting: S0
+  setting: S1
   sam:
     model_type: vit_b
     checkpoint: ${SAM_VIT_B_CHECKPOINT}
@@ -31,6 +31,7 @@ model:
 train:
   epochs: 80
   batch_size: 8
+  grad_accum_steps: 1
   num_workers: 8
   lr_decoder: 1.0e-4
   lr_sam: 1.0e-5
