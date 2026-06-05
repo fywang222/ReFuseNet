@@ -245,7 +245,7 @@ class DPTSemanticDecoder(nn.Module):
     S4/S5 decoder: shared reassembly plus one semantic DPT top-down fusion branch.
 
     This intentionally has no boundary branch. Dual-branch boundary decoding is
-    reserved for the S6 DualDPTBoundaryDecoder.
+    kept in the optional DualDPTBoundaryDecoder.
     """
 
     def __init__(
@@ -293,7 +293,7 @@ class DPTSemanticDecoder(nn.Module):
 
 class DualDPTBoundaryDecoder(nn.Module):
     """
-    S6 decoder: DA3-style DualDPT with a PIDNet-style one-channel boundary head.
+    Optional DA3-style DualDPT with a PIDNet-style one-channel boundary head.
 
     The semantic and boundary branches have independent top-down DPT fusion blocks.
     Boundary supervision is intentionally left to the trainer/loss code.
@@ -427,8 +427,8 @@ class RefuseNet(nn.Module):
     S2: low-LR SAM fine-tune + pseudo 4-scale features + naive multiscale decoder.
     S3: low-LR SAM fine-tune + true 4-level SAM features + naive multiscale decoder.
     S4: low-LR SAM fine-tune + true 4-level SAM features + DPT semantic decoder.
-    S5: S4 plus iterative GRU refinement and coarse-logit auxiliary loss.
-    S6: DA3-style DualDPT decoder plus a PIDNet-style boundary head.
+    S5: S4 plus iterative GRU refinement at the shared head resolution.
+    S6: S2 pseudo-pyramid decoder plus a boundary head.
     S7: S2 plus iterative GRU refinement.
     """
 
@@ -465,7 +465,7 @@ class RefuseNet(nn.Module):
         },
         "S6": {
             "sam": {"train_mode": "low_lr_ft"},
-            "decoder": {"feature_mode": "dualdpt", "fusion_mode": "dualdpt"},
+            "decoder": {"feature_mode": "pseudo_pyramid", "fusion_mode": "multiscale"},
             "refine": {"enabled": False},
             "boundary": {"enabled": True},
         },
@@ -537,6 +537,7 @@ class RefuseNet(nn.Module):
             raise ValueError(f"decoder.head_resolution must have two values, got {self.decoder_cfg['head_resolution']}")
 
         self.classifier = None if self.setting == "S0" else nn.Conv2d(self.head_channels, self.num_classes, kernel_size=1)
+        self.boundary_head = None
 
         if self.feature_mode == "final":
             if self.setting == "S0":
@@ -549,7 +550,7 @@ class RefuseNet(nn.Module):
                     head_resolution=self.head_resolution,
                 )
         elif self.feature_mode == "pseudo_pyramid":
-            in_channels = [final_channels for _ in self.decoder_cfg["pseudo_scales"]]
+            in_channels = [final_channels for _ in range(4)]
             self.decoder = MultiScaleFusionDecoder(
                 in_channels=in_channels,
                 decoder_dim=decoder_dim,
@@ -601,6 +602,11 @@ class RefuseNet(nn.Module):
                 hidden_channels=int(self.refine_cfg.get("hidden_dim", 64)),
                 iters=int(self.refine_cfg.get("iters", 3)),
                 delta_scale=float(self.refine_cfg.get("delta_scale", 1.0)),
+            )
+        if bool(self.boundary_cfg.get("enabled", False)) and self.feature_mode != "dualdpt":
+            self.boundary_head = nn.Sequential(
+                ConvGNAct(self.head_channels, self.head_channels),
+                nn.Conv2d(self.head_channels, 1, kernel_size=1),
             )
 
     @classmethod
@@ -677,10 +683,10 @@ class RefuseNet(nn.Module):
         if cfg["decoder"]["feature_mode"] in {"multi_level", "dualdpt"}:
             if len(cfg["sam"]["intermediate_blocks"]) != 4:
                 raise ValueError(f"{cfg['decoder']['fusion_mode']}/DPT requires exactly four sam.intermediate_blocks.")
+        if cfg["decoder"]["feature_mode"] == "pseudo_pyramid" and cfg["decoder"]["pseudo_scales"] != [4, 8, 16, 32]:
+            raise ValueError("decoder.pseudo_scales must be [4, 8, 16, 32] for the fixed 256/128/64/32 pyramid.")
         if cfg["decoder"]["feature_mode"] == "dualdpt":
             cfg["boundary"]["enabled"] = True
-        elif bool(cfg["boundary"].get("enabled", False)):
-            raise ValueError("boundary.enabled is only supported when decoder.feature_mode is 'dualdpt'.")
         return cfg
 
     def _build_sam_image_encoder(self) -> nn.Module:
@@ -902,6 +908,10 @@ class RefuseNet(nn.Module):
             out["aux_logits_head"] = aux_logits_head
         if "boundary_logits" in decoder_out:
             out["boundary_logits"] = self._restore_logits(decoder_out["boundary_logits"], preprocess_meta)
+        elif self.boundary_head is not None:
+            boundary_logits = self.boundary_head(semantic_features)
+            boundary_logits = F.interpolate(boundary_logits, size=output_size, mode="bilinear", align_corners=False)
+            out["boundary_logits"] = self._restore_logits(boundary_logits, preprocess_meta)
         if self.debug:
             out["features"] = {
                 "final": final_feature,
@@ -923,7 +933,7 @@ class RefuseNet(nn.Module):
             groups.append({"params": sam_params, "lr": lr_sam, "weight_decay": weight_decay, "name": "sam_image_encoder"})
 
         decoder_params = []
-        for module in (self.decoder, self.refiner, self.classifier):
+        for module in (self.decoder, self.refiner, self.classifier, self.boundary_head):
             if module is not None:
                 decoder_params.extend(param for param in module.parameters() if param.requires_grad)
         groups.append({"params": decoder_params, "lr": lr_decoder, "weight_decay": weight_decay, "name": "decoder"})

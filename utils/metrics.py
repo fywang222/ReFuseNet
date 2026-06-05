@@ -34,7 +34,19 @@ class SegMetric:
             target = target[None, ...]
 
         for p, t in zip(pred, target):
-            valid = (t != self.ignore_index) & (t >= 0) & (t < self.num_classes) & (p >= 0) & (p < self.num_classes)
+            valid = t != self.ignore_index
+            invalid_target = valid & ((t < 0) | (t >= self.num_classes))
+            if invalid_target.any():
+                bad_values = np.unique(t[invalid_target])[:10].tolist()
+                raise ValueError(
+                    f"SegMetric target contains non-ignore labels outside [0,{self.num_classes}): {bad_values}"
+                )
+            invalid_pred = (p < 0) | (p >= self.num_classes)
+            if invalid_pred.any():
+                bad_values = np.unique(p[invalid_pred])[:10].tolist()
+                raise ValueError(
+                    f"SegMetric pred contains labels outside [0,{self.num_classes}): {bad_values}"
+                )
             p = p[valid]
             t = t[valid]
             if t.size == 0:
@@ -48,14 +60,12 @@ class SegMetric:
         pos_gt = self.confusion.sum(axis=1).astype(np.float64)
         pos_pred = self.confusion.sum(axis=0).astype(np.float64)
         union = pos_gt + pos_pred - tp
-        ious = np.divide(tp, union, out=np.zeros_like(tp), where=union > 0)
-        acc = np.divide(tp, pos_gt, out=np.zeros_like(tp), where=pos_gt > 0)
-        valid_iou = union > 0
-        valid_acc = pos_gt > 0
+        ious = np.divide(tp, union, out=np.full_like(tp, np.nan), where=union > 0)
+        acc = np.divide(tp, pos_gt, out=np.full_like(tp, np.nan), where=pos_gt > 0)
 
         pixel_acc = float(tp.sum() / max(self.confusion.sum(), 1))
-        mean_acc = float(acc[valid_acc].mean()) if valid_acc.any() else 0.0
-        miou = float(ious[valid_iou].mean()) if valid_iou.any() else 0.0
+        mean_acc = float(np.nanmean(acc))
+        miou = float(np.nanmean(ious))
         result = {
             "miou": miou,
             "ious": ious.tolist(),
@@ -70,7 +80,6 @@ class SegMetric:
         if self.class_names is not None and self.rare_class_names:
             rare_ids = [self.class_names.index(name) for name in self.rare_class_names if name in self.class_names]
             if rare_ids:
-                rare_valid = valid_iou[rare_ids]
                 rare_iou = ious[rare_ids]
-                result["rare_miou"] = float(rare_iou[rare_valid].mean()) if rare_valid.any() else 0.0
+                result["rare_miou"] = float(np.nanmean(rare_iou))
         return result

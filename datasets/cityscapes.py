@@ -92,11 +92,37 @@ class CityscapesDataset(Dataset):
         for _, mask_path in self.samples[:32]:
             if "labelTrainIds" in mask_path.name:
                 return "trainIds"
-            label_values = np.array(Image.open(mask_path))
-            unique_values = np.unique(label_values)
-            if np.any(unique_values > 18):
+            unique_values = np.unique(np.array(Image.open(mask_path)))
+            invalid_train_ids = (unique_values > 18) & (unique_values != 255)
+            if np.any(invalid_train_ids):
                 return "labelIds"
         return "trainIds"
+
+    def _load_mask(self, mask_path):
+        mask_ids = np.array(Image.open(mask_path))
+        if self.label_format == "labelIds":
+            mask_ids = cityscapes_label_ids_to_train_ids(mask_ids)
+        else:
+            mask_ids = mask_ids.astype(np.uint8)
+            invalid = (mask_ids > 18) & (mask_ids != 255)
+            if invalid.any():
+                bad_values = np.unique(mask_ids[invalid])[:10].tolist()
+                raise ValueError(
+                    f"Cityscapes trainIds mask contains labels outside 0..18/255: "
+                    f"{bad_values} in {mask_path}"
+                )
+        return Image.fromarray(mask_ids.astype(np.uint8), mode="L")
+
+    def _mask_path_for_image(self, image_path):
+        city = image_path.parent.name
+        base = image_path.name.replace("_leftImg8bit.png", "")
+        label_dir = self.root / "gtFine" / self.split / city
+        if self.label_format == "trainIds":
+            return label_dir / f"{base}_gtFine_labelTrainIds.png"
+        if self.label_format == "labelIds":
+            return label_dir / f"{base}_gtFine_labelIds.png"
+        train_ids_path = label_dir / f"{base}_gtFine_labelTrainIds.png"
+        return train_ids_path if train_ids_path.exists() else label_dir / f"{base}_gtFine_labelIds.png"
 
     def _resolve_from_list(self, line):
         parts = line.split()
@@ -112,9 +138,7 @@ class CityscapesDataset(Dataset):
             if not mask_path.exists():
                 raise FileNotFoundError(f"Cityscapes label not found: {mask_path}")
             return image_path, mask_path
-        city = image_path.parent.name
-        base = image_path.name.replace("_leftImg8bit.png", "")
-        mask_path = self.root / "gtFine" / self.split / city / f"{base}_gtFine_labelIds.png"
+        mask_path = self._mask_path_for_image(image_path)
         if not image_path.exists():
             raise FileNotFoundError(f"Cityscapes image not found: {image_path}")
         if not mask_path.exists():
@@ -151,9 +175,7 @@ class CityscapesDataset(Dataset):
 
         samples = []
         for image_path in sorted(img_root.rglob("*_leftImg8bit.png")):
-            city = image_path.parent.name
-            base = image_path.name.replace("_leftImg8bit.png", "")
-            mask_path = self.root / "gtFine" / self.split / city / f"{base}_gtFine_labelIds.png"
+            mask_path = self._mask_path_for_image(image_path)
             if not mask_path.exists():
                 raise FileNotFoundError(f"Cityscapes label not found: {mask_path}")
             samples.append((image_path, mask_path))
@@ -170,16 +192,7 @@ class CityscapesDataset(Dataset):
             raise FileNotFoundError(f"Cityscapes label not found for image: {image_path}")
         image = Image.open(image_path).convert("RGB")
         orig_size = image.size[::-1]
-        label_ids = np.array(Image.open(mask_path))
-        if self.label_format == "labelIds":
-            mask_ids = cityscapes_label_ids_to_train_ids(label_ids)
-        else:
-            mask_ids = label_ids.astype(np.uint8)
-            invalid = (mask_ids > 18) & (mask_ids != 255)
-            if invalid.any():
-                mask_ids = mask_ids.copy()
-                mask_ids[invalid] = 255
-        mask = Image.fromarray(mask_ids.astype(np.uint8), mode="L")
+        mask = self._load_mask(mask_path)
 
         sample = {
             "image": image,

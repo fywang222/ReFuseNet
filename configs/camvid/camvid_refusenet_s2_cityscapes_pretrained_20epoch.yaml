@@ -1,6 +1,6 @@
 experiment:
-  name: camvid_refusenet_s0
-  output_dir: outputs/camvid_refusenet_s0
+  name: camvid_refusenet_s2_cityscapes_pretrained_20epoch
+  output_dir: outputs/camvid_refusenet_s2_cityscapes_pretrained_20epoch
   seed: 42
 dataset:
   name: camvid
@@ -26,7 +26,7 @@ dataset:
   - 0.225
 model:
   name: ReFuseNet
-  setting: S0
+  setting: S2
   sam:
     model_type: vit_b
     checkpoint: checkpoints/sam_vit_b_01ec64.pth
@@ -37,8 +37,13 @@ model:
     head_resolution:
     - 256
     - 256
+    pseudo_scales:
+    - 4
+    - 8
+    - 16
+    - 32
 train:
-  epochs: 200
+  epochs: 20
   batch_size: 2
   grad_accum_steps: 4
   num_workers: 8
@@ -51,7 +56,7 @@ train:
   - 480
   log_every_steps: 10
   eval_every: 10
-  save_every: 50
+  save_every: 20
   scheduler:
     type: poly
     power: 1.0

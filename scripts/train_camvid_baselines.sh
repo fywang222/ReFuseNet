@@ -3,7 +3,7 @@ set -euo pipefail
 
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_PROJECT="${WANDB_PROJECT:-refusenet}"
-export SAM_VIT_B_CHECKPOINT="${SAM_VIT_B_CHECKPOINT:-/absolute/path/to/sam_vit_b.pth}"
+export SAM_VIT_B_CHECKPOINT="${SAM_VIT_B_CHECKPOINT:-checkpoints/sam_vit_b_01ec64.pth}"
 
 PYTHON="${PYTHON:-python}"
 DEVICE="${DEVICE:-cuda}"
@@ -12,7 +12,7 @@ if [[ -n "${WANDB_API_KEY}" ]]; then
   wandb login "${WANDB_API_KEY}"
 fi
 
-GPUS=(${GPUS:-0 1 2 3})
+GPUS=(${GPUS:-1 2 3})
 
 mkdir -p outputs/logs
 
@@ -42,23 +42,94 @@ run_one() {
     2>&1 | tee "outputs/logs/${name}.console.log"
 }
 
-batch_size="${#GPUS[@]}"
 num_configs="${#CONFIGS[@]}"
+next_config=0
+failed=0
+status_dir="$(mktemp -d outputs/logs/camvid_pool.XXXXXX)"
+RUNNING_PIDS=()
+RUNNING_GPUS=()
+RUNNING_CONFIGS=()
+FREE_GPUS=("${GPUS[@]}")
 
-for ((start=0; start<num_configs; start+=batch_size)); do
-  echo "========== launching batch starting at index ${start} =========="
+cleanup() {
+  rm -rf "${status_dir}"
+}
+trap cleanup EXIT
 
-  for ((i=0; i<batch_size; i++)); do
-    idx=$((start + i))
-    if (( idx >= num_configs )); then
-      break
+launch_on_gpu() {
+  local gpu="$1"
+  local config="$2"
+  local pid
+
+  (
+    set +e
+    run_one "${gpu}" "${config}"
+    status="$?"
+    echo "${status}" > "${status_dir}/${BASHPID}.status"
+    exit "${status}"
+  ) &
+  pid="$!"
+
+  RUNNING_PIDS+=("${pid}")
+  RUNNING_GPUS+=("${gpu}")
+  RUNNING_CONFIGS+=("${config}")
+}
+
+launch_next_if_possible() {
+  while (( next_config < num_configs && ${#FREE_GPUS[@]} > 0 )); do
+    local gpu="${FREE_GPUS[0]}"
+    FREE_GPUS=("${FREE_GPUS[@]:1}")
+    launch_on_gpu "${gpu}" "${CONFIGS[$next_config]}"
+    next_config=$((next_config + 1))
+  done
+}
+
+collect_finished() {
+  local new_pids=()
+  local new_gpus=()
+  local new_configs=()
+
+  for ((i=0; i<${#RUNNING_PIDS[@]}; i++)); do
+    local pid="${RUNNING_PIDS[$i]}"
+    local gpu="${RUNNING_GPUS[$i]}"
+    local config="${RUNNING_CONFIGS[$i]}"
+    local status_file="${status_dir}/${pid}.status"
+
+    if [[ -f "${status_file}" ]]; then
+      local status
+      status="$(cat "${status_file}")"
+      rm -f "${status_file}"
+      wait "${pid}" 2>/dev/null || true
+      echo "[finish] GPU=${gpu} config=${config} status=${status}"
+      if [[ "${status}" != "0" ]]; then
+        failed=1
+      fi
+      FREE_GPUS+=("${gpu}")
+    else
+      new_pids+=("${pid}")
+      new_gpus+=("${gpu}")
+      new_configs+=("${config}")
     fi
-
-    run_one "${GPUS[$i]}" "${CONFIGS[$idx]}" &
   done
 
-  wait
-  echo "========== batch finished =========="
+  RUNNING_PIDS=("${new_pids[@]}")
+  RUNNING_GPUS=("${new_gpus[@]}")
+  RUNNING_CONFIGS=("${new_configs[@]}")
+}
+
+launch_next_if_possible
+
+while (( ${#RUNNING_PIDS[@]} > 0 )); do
+  set +e
+  wait -n
+  set -e
+  collect_finished
+  launch_next_if_possible
 done
+
+if (( failed != 0 )); then
+  echo "Some CamVid jobs failed."
+  exit 1
+fi
 
 echo "All CamVid jobs finished."

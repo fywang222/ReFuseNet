@@ -43,6 +43,12 @@ train:
   log_every_steps: 10
   eval_every: 10
   save_every: 50
+  scheduler:
+    type: poly
+    power: 1.0
+    warmup_iters: 500
+    warmup_ratio: 1.0e-06
+    min_factor: 0.0
 eval:
   batch_size: 4
   inference: whole

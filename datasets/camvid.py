@@ -110,7 +110,7 @@ def _resolve_camvid_pair(root: Path, token: str, split: str | None = None):
         label_dirs.extend([image_path.parent.parent / "labels", image_path.parent.parent / "Labels"])
     for folder in label_dirs:
         label_candidates.extend([folder / name for name in label_names])
-    label_path = next((p for p in label_candidates if p.exists()), None)
+    label_path = next((p for p in label_candidates if p != image_path and p.exists()), None)
     if label_path is None:
         raise FileNotFoundError(f"Could not resolve CamVid label path for token: {token}")
     return image_path, label_path

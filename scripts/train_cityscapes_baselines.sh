@@ -3,7 +3,7 @@ set -euo pipefail
 
 export WANDB_API_KEY="${WANDB_API_KEY:-}"
 export WANDB_PROJECT="${WANDB_PROJECT:-refusenet}"
-export SAM_VIT_B_CHECKPOINT="${SAM_VIT_B_CHECKPOINT:-/absolute/path/to/sam_vit_b.pth}"
+export SAM_VIT_B_CHECKPOINT="${SAM_VIT_B_CHECKPOINT:-checkpoints/sam_vit_b_01ec64.pth}"
 
 PYTHON="${PYTHON:-python}"
 DEVICE="${DEVICE:-cuda}"

@@ -12,7 +12,7 @@ if str(ROOT) not in sys.path:
 import numpy as np
 import torch
 
-from tools.common import build_dataloader, load_config
+from tools.common import build_dataloader, get_color_map, load_config
 from utils.logger import setup_logger
 from utils.visualization import save_segmentation_visualization
 
@@ -53,6 +53,7 @@ def main():
             pred_mask=masks[0],
             out_dir=out_dir,
             name=f"{args.split}_{idx}",
+            color_map=get_color_map(cfg),
         )
         if idx + 1 >= args.num_samples:
             break
@@ -64,4 +65,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

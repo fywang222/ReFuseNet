@@ -63,11 +63,12 @@ def load_checkpoint(path, model, optimizer=None, strict=False, match_shape=True,
     else:
         missing, unexpected = _unwrap_model(model).load_state_dict(state_dict, strict=strict)
         print(f"[checkpoint] loaded checkpoint from {path}")
-        if verbose:
-            if missing:
-                print(f"[checkpoint] missing keys: {missing}")
-            if unexpected:
-                print(f"[checkpoint] unexpected keys: {unexpected}")
+        print(f"[checkpoint] missing keys: {len(missing)}")
+        print(f"[checkpoint] unexpected keys: {len(unexpected)}")
+        if verbose and missing:
+            print(f"[checkpoint] missing key names: {missing}")
+        if verbose and unexpected:
+            print(f"[checkpoint] unexpected key names: {unexpected}")
 
     if optimizer is not None and checkpoint.get("optimizer") is not None and not match_shape:
         optimizer.load_state_dict(checkpoint["optimizer"])

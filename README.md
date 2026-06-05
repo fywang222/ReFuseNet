@@ -63,7 +63,14 @@ data/
 
 CamVid labels may be grayscale class ids or RGB masks. Valid classes are `0..10`; invalid/void ids are mapped to `255`.
 
-Cityscapes uses original `leftImg8bit` images as inputs and `gtFine` masks as targets. Configs set `dataset.label_format: auto`, so masks are detected as either original `*_gtFine_labelIds.png` files, which are mapped to 19 trainIds, or already-converted trainId masks, which are used directly. `gtFine` color or label files are not used as image-input fallbacks. Training startup logs the dataset size, inferred label format, and the first three image/mask paths for both train and val.
+Cityscapes uses original `leftImg8bit` images as inputs and `*_gtFine_labelTrainIds.png` masks as targets. Configs set `dataset.label_format: trainIds`, so masks are consumed directly as trainIds `0..18` plus ignore `255`. If `dataset.label_format: labelIds` is used, the loader instead reads `*_gtFine_labelIds.png` and maps original Cityscapes labelIds to trainIds. `gtFine` color or label files are not used as image-input fallbacks. Training startup logs the dataset size, label format, and the first three image/mask paths for both train and val.
+
+Generate Cityscapes trainId masks with the official Cityscapes scripts before training:
+
+```bash
+pip install cityscapesscripts
+CITYSCAPES_DATASET=data/Cityscapes python -m cityscapesscripts.preparation.createTrainIdLabelImgs
+```
 
 ## Transforms And Evaluation
 
@@ -84,7 +91,7 @@ train:    RandomResize(scale=(2048,1024), ratio_range=(0.5,2.0), keep_ratio=True
           -> PhotoMetricDistortion
           -> ToTensor -> Normalize
 val/test: whole image input, no resize
-eval:     sliding-window inference, crop=1024, stride=768
+eval:     SegFormer/MMseg-style sliding-window inference, crop=1024, stride=768, batch_size=1
 ```
 
 ## Models
@@ -109,7 +116,7 @@ ReFuseNet remains a single configurable top-level class. Do not create `ReFuseNe
 | S3 | low-LR SAM fine-tune + true 4-level SAM features + naive multiscale decoder |
 | S4 | low-LR SAM fine-tune + true 4-level SAM features + DPT-style semantic decoder |
 | S5 | S4 + GRU-style iterative refinement |
-| S6 | DA3-style Dual-DPT dual-branch boundary decoder, kept in code/config but not run by default scripts |
+| S6 | S2 pseudo-pyramid decoder plus a boundary head |
 | S7 | S2 + GRU-style iterative refinement |
 
 Decoder fields:
@@ -125,13 +132,13 @@ decoder:
   dpt_head_scale: p1
 ```
 
-S1-S6 all produce `semantic_features` with shape `[B, head_channels, 256, 256]` before the shared classifier. S0 keeps the legacy frozen-SAM baseline head. S5 refines classifier head logits at `[B, C, 256, 256]`, not full-resolution logits.
+S1-S7 all produce `semantic_features` with shape `[B, head_channels, 256, 256]` before the shared classifier. S0 keeps the legacy frozen-SAM baseline head. S5/S7 refine classifier head logits at `[B, C, 256, 256]`, not full-resolution logits.
 
 Forward outputs:
 
 - All settings return `logits`.
 - Only `refine.enabled: true` returns `coarse_logits`, `aux_logits`, `coarse_logits_head`, and `aux_logits_head`.
-- Only S6 / `feature_mode: dualdpt` returns `boundary_logits`.
+- Only S6 / `boundary.enabled: true` returns `boundary_logits`.
 - `debug: true` adds feature tensors for inspection.
 
 SAM preprocessing inside ReFuseNet:
@@ -152,6 +159,15 @@ Training loss:
 - `tools/train.py` calls `model.get_param_groups(cfg)` when available, so `lr_sam` and `lr_decoder` are respected
 - The S5/S6 weights live in `train.lambda_aux`, `train.lambda_refine_aux`, `train.lambda_coarse_aux`, and `train.lambda_boundary`
 
+Learning rate schedule:
+
+- All configs use AdamW with poly LR decay and linear warmup, following the common SegFormer/MMSeg training setup.
+- The scheduler steps on optimizer updates, not raw dataloader batches, so it respects `grad_accum_steps`.
+- Cityscapes configs use `warmup_iters: 1500`; CamVid configs use `warmup_iters: 500`.
+- Step logs include `lr_factor`; W&B logs `train/lr_factor` and per-group LR values when parameter groups are named.
+
+Historical note: the first completed CamVid experiment wave was run before LR scheduling was added. Those CamVid results used fixed learning rates for the full run, with no warmup and no poly decay. Current configs are the follow-up version with scheduler enabled.
+
 ## Main Training Scripts
 
 CamVid runs FCN, SegFormer-B5, and ReFuseNet S0-S5/S7 for 200 epochs by default:
@@ -162,7 +178,7 @@ export PYTHON=python
 bash scripts/train_camvid_baselines.sh
 ```
 
-Cityscapes runs FCN, SegFormer-B5, and ReFuseNet S0-S5/S7 using each config's `train.epochs` value:
+Cityscapes runs FCN, SegFormer-B5, and ReFuseNet S0-S7 using each config's `train.epochs` value:
 
 ```bash
 export WANDB_API_KEY=<wandb_api_key>
@@ -194,7 +210,7 @@ Batch and accumulation defaults:
 | CamVid | SegFormer-B5 | 4 | 2 |
 | CamVid | ReFuseNet S0-S7 | 2 | 4 |
 
-ReFuseNet S1-S7 fine-tune the SAM encoder with `lr_sam`, so they use much more training memory than S0 even with the same batch size. Cityscapes eval batch size is 4 by default; if OOM happens during evaluation, reduce `eval.batch_size` or override the config.
+ReFuseNet S1-S7 fine-tune the SAM encoder with `lr_sam`, so they use much more training memory than S0 even with the same batch size. Cityscapes eval batch size is 1 by default.
 
 ## Single Run
 
@@ -212,13 +228,9 @@ S5 debug, evaluating and printing debug metrics every epoch:
 python tools/train.py --config configs/cityscapes/cityscapes_refusenet_s5.yaml --device cuda --s5-debug --eval-every 1
 ```
 
-Cityscapes sliding-window overlap sanity check:
+Cityscapes default eval follows the SegFormer/MMseg 1024x1024 slide-inference setup: overlapping logits are accumulated on the full image and divided by a per-pixel crop count map. The implementation raises an error if any pixel is not covered.
 
-```bash
-python tools/train.py --config configs/cityscapes/cityscapes_segformer_b5.yaml --device cuda --eval-overlap-debug
-```
-
-`--eval-overlap-debug` compares whole-image and sliding-window predictions on the first eval batch and prints `whole_mIoU`, `sliding_mIoU`, and `pred_diff_ratio`.
+Metric note: evaluation accumulates one full-validation `num_classes x num_classes` confusion matrix. Pixels with `ignore_index` are ignored, any non-ignore target or prediction outside `0..num_classes-1` raises an error, per-class IoU is `diag / (row_sum + col_sum - diag)`, classes with zero union are `NaN`, and mIoU is `np.nanmean(per_class_iou)`.
 
 Checkpoint outputs:
 

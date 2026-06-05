@@ -7,7 +7,7 @@ dataset:
   root: data/Cityscapes
   num_classes: 19
   ignore_index: 255
-  label_format: auto
+  label_format: trainIds
   train_split: train
   val_split: val
   test_split: val
@@ -63,8 +63,14 @@ train:
   log_every_steps: 10
   eval_every: 5
   save_every: 50
+  scheduler:
+    type: poly
+    power: 1.0
+    warmup_iters: 1500
+    warmup_ratio: 1.0e-06
+    min_factor: 0.0
 eval:
-  batch_size: 4
+  batch_size: 1
   inference: sliding
   sliding_crop_size:
   - 1024

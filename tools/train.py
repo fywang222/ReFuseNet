@@ -33,21 +33,7 @@ def parse_args():
     parser.add_argument("--device", default=None)
     parser.add_argument("--wandb", choices=["on", "off"], default=None)
     parser.add_argument("--s5-debug", action="store_true")
-    parser.add_argument("--eval-overlap-debug", action="store_true")
     return parser.parse_args()
-
-
-def _parse_epoch_set(value):
-    if value is None:
-        return set()
-    if isinstance(value, int):
-        return {value}
-    if isinstance(value, (list, tuple, set)):
-        return {int(item) for item in value}
-    text = str(value).strip()
-    if not text:
-        return set()
-    return {int(item.strip()) for item in text.split(",") if item.strip()}
 
 
 def _resolve_resume_checkpoint(resume, out_dir):
@@ -115,8 +101,58 @@ def _log_model_summary(logger, model, cfg):
     )
 
 
+def _optimizer_steps_per_epoch(num_batches: int, grad_accum_steps: int) -> int:
+    return (num_batches + grad_accum_steps - 1) // grad_accum_steps
+
+
+def _set_initial_lrs(optimizer) -> None:
+    for group in optimizer.param_groups:
+        group.setdefault("initial_lr", group["lr"])
+
+
+def _lr_factor(train_cfg: dict[str, Any], optimizer_step: int, total_steps: int) -> float:
+    scheduler_cfg = train_cfg.get("scheduler", {}) or {}
+    scheduler_type = str(scheduler_cfg.get("type", "none")).lower()
+    if scheduler_type in {"none", "constant"}:
+        return 1.0
+    if scheduler_type != "poly":
+        raise ValueError(f"Unsupported train.scheduler.type: {scheduler_type}")
+
+    total_steps = max(int(total_steps), 1)
+    warmup_iters = int(scheduler_cfg.get("warmup_iters", 0) or 0)
+    warmup_ratio = float(scheduler_cfg.get("warmup_ratio", 1.0e-6))
+    power = float(scheduler_cfg.get("power", 1.0))
+    min_factor = float(scheduler_cfg.get("min_factor", 0.0))
+
+    if warmup_iters > 0 and optimizer_step < warmup_iters:
+        alpha = optimizer_step / max(warmup_iters, 1)
+        return warmup_ratio + alpha * (1.0 - warmup_ratio)
+
+    progress = (optimizer_step - warmup_iters) / max(total_steps - warmup_iters, 1)
+    factor = (1.0 - min(max(progress, 0.0), 1.0)) ** power
+    return max(factor, min_factor)
+
+
+def _apply_lr_schedule(optimizer, train_cfg: dict[str, Any], optimizer_step: int, total_steps: int) -> float:
+    factor = _lr_factor(train_cfg, optimizer_step, total_steps)
+    for group in optimizer.param_groups:
+        group["lr"] = float(group["initial_lr"]) * factor
+    return factor
+
+
+def _format_group_lrs(optimizer) -> str:
+    return ", ".join(
+        f"{group.get('name', f'group{index}')}={group['lr']:.2e}"
+        for index, group in enumerate(optimizer.param_groups)
+    )
+
+
+def _base_dataset(dataset):
+    return dataset.dataset if hasattr(dataset, "dataset") else dataset
+
+
 def _dataset_sample_preview(dataset, limit: int = 3) -> list[tuple[str, str]]:
-    base_dataset = dataset.dataset if hasattr(dataset, "dataset") else dataset
+    base_dataset = _base_dataset(dataset)
     samples = list(getattr(base_dataset, "samples", []))
     if hasattr(dataset, "indices"):
         samples = [samples[index] for index in list(dataset.indices)[:limit]]
@@ -127,7 +163,7 @@ def _dataset_sample_preview(dataset, limit: int = 3) -> list[tuple[str, str]]:
 
 def _log_dataset_summary(logger, split: str, dataset) -> None:
     logger.info("dataset %s | samples=%d", split, len(dataset))
-    base_dataset = dataset.dataset if hasattr(dataset, "dataset") else dataset
+    base_dataset = _base_dataset(dataset)
     if hasattr(base_dataset, "label_format"):
         logger.info("dataset %s | label_format=%s", split, base_dataset.label_format)
     for index, (image_path, mask_path) in enumerate(_dataset_sample_preview(dataset), start=1):
@@ -158,13 +194,14 @@ def _compute_total_loss(cfg: dict[str, Any], outputs: dict[str, torch.Tensor], m
     parts: dict[str, torch.Tensor] = {"primary": total}
 
     if "coarse_logits" in outputs:
-        aux_weight = float(cfg["train"].get("lambda_aux", 0.4))
-        coarse_logits = outputs["coarse_logits"]
-        if coarse_logits.shape[-2:] != masks.shape[-2:]:
-            coarse_logits = F.interpolate(coarse_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
-        aux_loss = criterion(coarse_logits, masks)
-        total = total + aux_weight * aux_loss
-        parts["aux"] = aux_loss
+        aux_weight = float(cfg["train"].get("lambda_aux", 0.0))
+        if aux_weight > 0.0:
+            coarse_logits = outputs["coarse_logits"]
+            if coarse_logits.shape[-2:] != masks.shape[-2:]:
+                coarse_logits = F.interpolate(coarse_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+            aux_loss = criterion(coarse_logits, masks)
+            total = total + aux_weight * aux_loss
+            parts["aux"] = aux_loss
 
     if "boundary_logits" in outputs:
         boundary_weight = float(cfg["train"].get("lambda_boundary", 1.0))
@@ -320,29 +357,30 @@ def _sliding_window_s5_debug_outputs(model, images, crop_size=(1024, 1024), stri
     count = images.new_zeros((batch, 1, height, width))
     sums: dict[str, Any] | None = None
 
-    h_starts = list(range(0, max(height - crop_h, 0) + 1, stride_h))
-    w_starts = list(range(0, max(width - crop_w, 0) + 1, stride_w))
-    if not h_starts or h_starts[-1] != max(height - crop_h, 0):
-        h_starts.append(max(height - crop_h, 0))
-    if not w_starts or w_starts[-1] != max(width - crop_w, 0):
-        w_starts.append(max(width - crop_w, 0))
-
-    for top in h_starts:
-        for left in w_starts:
-            bottom = min(top + crop_h, height)
-            right = min(left + crop_w, width)
+    h_grids = max(height - crop_h + stride_h - 1, 0) // stride_h + 1
+    w_grids = max(width - crop_w + stride_w - 1, 0) // stride_w + 1
+    for h_idx in range(h_grids):
+        for w_idx in range(w_grids):
+            bottom = min(h_idx * stride_h + crop_h, height)
+            right = min(w_idx * stride_w + crop_w, width)
+            top = max(bottom - crop_h, 0)
+            left = max(right - crop_w, 0)
             crop = images[:, :, top:bottom, left:right]
-            pad_h = crop_h - crop.shape[-2]
-            pad_w = crop_w - crop.shape[-1]
-            if pad_h > 0 or pad_w > 0:
-                crop = F.pad(crop, (0, pad_w, 0, pad_h))
 
             crop_outputs = _forward_s5_debug_outputs(model, crop)
-            crop_logits = crop_outputs["logits"][:, :, : bottom - top, : right - left]
-            crop_coarse = crop_outputs["coarse_logits"][:, :, : bottom - top, : right - left]
+            crop_logits = crop_outputs["logits"]
+            crop_coarse = crop_outputs["coarse_logits"]
+            crop_aux = list(crop_outputs.get("aux_logits", []))
+            region_size = (bottom - top, right - left)
+            if crop_logits.shape[-2:] != region_size:
+                crop_logits = F.interpolate(crop_logits, size=region_size, mode="bilinear", align_corners=False)
+            if crop_coarse.shape[-2:] != region_size:
+                crop_coarse = F.interpolate(crop_coarse, size=region_size, mode="bilinear", align_corners=False)
             crop_aux = [
-                aux[:, :, : bottom - top, : right - left]
-                for aux in crop_outputs.get("aux_logits", [])
+                F.interpolate(aux, size=region_size, mode="bilinear", align_corners=False)
+                if aux.shape[-2:] != region_size
+                else aux
+                for aux in crop_aux
             ]
 
             if sums is None:
@@ -356,14 +394,17 @@ def _sliding_window_s5_debug_outputs(model, images, crop_size=(1024, 1024), stri
                     ],
                 }
 
-            sums["logits"][:, :, top:bottom, left:right] += crop_logits
-            sums["coarse_logits"][:, :, top:bottom, left:right] += crop_coarse
+            pad = (left, width - right, top, height - bottom)
+            sums["logits"] += F.pad(crop_logits, pad)
+            sums["coarse_logits"] += F.pad(crop_coarse, pad)
             for index, aux in enumerate(crop_aux):
-                sums["aux_logits"][index][:, :, top:bottom, left:right] += aux
+                sums["aux_logits"][index] += F.pad(aux, pad)
             count[:, :, top:bottom, left:right] += 1
 
     if sums is None:
         raise RuntimeError("No sliding-window crops were evaluated.")
+    if (count == 0).any():
+        raise RuntimeError("S5 debug sliding-window inference produced uncovered pixels.")
     sums["logits"] = sums["logits"] / count.clamp_min(1)
     sums["coarse_logits"] = sums["coarse_logits"] / count.clamp_min(1)
     sums["aux_logits"] = [aux / count.clamp_min(1) for aux in sums["aux_logits"]]
@@ -374,8 +415,7 @@ def _sliding_window_s5_debug_outputs(model, images, crop_size=(1024, 1024), stri
 def _evaluate_s5_debug(model, loader, metric_builder, device, cfg):
     model.eval()
     eval_cfg = cfg.get("eval", {})
-    dataset_name = cfg.get("dataset", {}).get("name", "").lower()
-    inference = eval_cfg.get("inference", "sliding" if dataset_name == "cityscapes" else "whole")
+    inference = eval_cfg.get("inference", "sliding")
     crop_size = tuple(eval_cfg.get("sliding_crop_size", (1024, 1024)))
     stride = tuple(eval_cfg.get("sliding_stride", (768, 768)))
 
@@ -442,6 +482,7 @@ def main():
         lr=cfg["train"].get("lr", cfg["train"].get("lr_decoder", 1.0e-4)),
         weight_decay=cfg["train"].get("weight_decay", 0.0),
     )
+    _set_initial_lrs(optimizer)
     scaler = torch.cuda.amp.GradScaler(enabled=bool(cfg["train"].get("amp", False)) and device.type == "cuda")
 
     start_epoch = 0
@@ -490,17 +531,24 @@ def main():
 
     epoch_ckpt_dir = out_dir / "checkpoints"
     global_step = start_epoch * len(train_loader)
-    optimizer_step = start_epoch * ((len(train_loader) + grad_accum_steps - 1) // grad_accum_steps)
+    steps_per_epoch = _optimizer_steps_per_epoch(len(train_loader), grad_accum_steps)
+    total_optimizer_steps = max(epochs * steps_per_epoch, 1)
+    optimizer_step = start_epoch * steps_per_epoch
     if "resumed_optimizer_step" in locals() and resumed_optimizer_step is not None:
         optimizer_step = int(resumed_optimizer_step)
+    lr_factor = _apply_lr_schedule(optimizer, cfg["train"], optimizer_step, total_optimizer_steps)
 
     logger.info(
-        "schedule | epochs=%d | log_every_steps=%d | eval_every=%d | save_every=%d | grad_accum_steps=%d",
+        "schedule | epochs=%d | log_every_steps=%d | eval_every=%d | save_every=%d | "
+        "grad_accum_steps=%d | optimizer_steps=%d | lr_factor=%.6f | lrs=%s",
         epochs,
         log_every_steps,
         eval_every,
         save_every,
         grad_accum_steps,
+        total_optimizer_steps,
+        lr_factor,
+        _format_group_lrs(optimizer),
     )
 
     for epoch in range(start_epoch, epochs):
@@ -542,8 +590,9 @@ def main():
             if should_step:
                 scaler.step(optimizer)
                 scaler.update()
-                optimizer.zero_grad(set_to_none=True)
                 optimizer_step += 1
+                lr_factor = _apply_lr_schedule(optimizer, cfg["train"], optimizer_step, total_optimizer_steps)
+                optimizer.zero_grad(set_to_none=True)
 
             total_value = float(parts["total"].item())
             primary_value = float(parts["primary"].item())
@@ -570,6 +619,7 @@ def main():
                     f"step {step}/{len(train_loader)} "
                     f"global_step={global_step} "
                     f"optimizer_step={optimizer_step} "
+                    f"lr_factor={lr_factor:.6f} "
                     f"loss={total_value:.4f} "
                     f"primary={primary_value:.4f}"
                 )
@@ -597,8 +647,12 @@ def main():
                     "train/step_loss": total_value,
                     "train/step_primary_loss": primary_value,
                     "train/optimizer_step": optimizer_step,
+                    "train/lr_factor": lr_factor,
                     "epoch": epoch + 1,
                 }
+                for group in optimizer.param_groups:
+                    if "name" in group:
+                        wandb_payload[f"train/lr/{group['name']}"] = group["lr"]
                 if aux_value is not None:
                     wandb_payload["train/step_aux_loss"] = aux_value
                 if boundary_value is not None:
@@ -668,8 +722,6 @@ def main():
                     metric,
                     device,
                     cfg=cfg,
-                    overlap_debug=args.eval_overlap_debug,
-                    logger=logger,
                 )
             last_metrics = val_metrics
             last_eval_epoch = completed_epoch
