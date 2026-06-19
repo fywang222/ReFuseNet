@@ -291,6 +291,182 @@ class DPTSemanticDecoder(nn.Module):
         return {"semantic_features": semantic_features}
 
 
+class ImagePyramidEncoder(nn.Module):
+    """Lightweight CNN image branch producing 256/128 feature maps for C2/C4."""
+
+    def __init__(self, out_channels: int = 64):
+        super().__init__()
+        self.stem = nn.Sequential(
+            ConvGNAct(3, 32),
+            ConvGNAct(32, 32),
+        )
+        self.down2 = nn.Sequential(
+            nn.Conv2d(32, 48, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(_group_count(48), 48),
+            nn.GELU(),
+            ConvGNAct(48, 48),
+        )
+        self.down4 = nn.Sequential(
+            nn.Conv2d(48, out_channels, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(_group_count(out_channels), out_channels),
+            nn.GELU(),
+            ConvGNAct(out_channels, out_channels),
+        )
+        self.down8 = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.GroupNorm(_group_count(out_channels), out_channels),
+            nn.GELU(),
+            ConvGNAct(out_channels, out_channels),
+        )
+
+    def forward(self, x: torch.Tensor) -> list[torch.Tensor]:
+        x = self.stem(x)
+        x = self.down2(x)
+        f256 = self.down4(x)
+        f128 = self.down8(f256)
+        return [f256, f128]
+
+
+class CnnSamPyramidDecoder(nn.Module):
+    """C2/C4 decoder: natural CNN scales concatenated with final SAM feature pyramid."""
+
+    def __init__(
+        self,
+        sam_channels: int,
+        decoder_dim: int,
+        head_channels: int,
+        head_resolution: tuple[int, int],
+        cnn_channels: int = 64,
+    ):
+        super().__init__()
+        self.out_channels = head_channels
+        self.head_resolution = tuple(head_resolution)
+        self.image_encoder = ImagePyramidEncoder(cnn_channels)
+        self.cnn_sam_projections = nn.ModuleList(
+            [ConvGNAct(cnn_channels + sam_channels, decoder_dim) for _ in range(2)]
+        )
+        self.sam_projections = nn.ModuleList([ConvGNAct(sam_channels, decoder_dim) for _ in range(2)])
+        self.lateral_fuse = nn.ModuleList([ConvGNAct(decoder_dim, decoder_dim) for _ in range(3)])
+        self.neck = nn.Sequential(
+            ConvGNAct(decoder_dim, decoder_dim),
+            nn.Conv2d(decoder_dim, head_channels, kernel_size=1),
+        )
+        self.gru_context = nn.Sequential(
+            nn.Conv2d(sam_channels, head_channels, kernel_size=1, bias=False),
+            nn.GroupNorm(_group_count(head_channels), head_channels),
+            nn.GELU(),
+        )
+
+    def _concat_sam(self, cnn_feature: torch.Tensor, sam_feature: torch.Tensor) -> torch.Tensor:
+        sam = F.interpolate(sam_feature, size=cnn_feature.shape[-2:], mode="bilinear", align_corners=False)
+        return torch.cat([cnn_feature, sam], dim=1)
+
+    def forward(
+        self,
+        inputs: tuple[torch.Tensor, torch.Tensor],
+        output_size: tuple[int, int],
+        return_features: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        del output_size, return_features
+        image, sam_feature = inputs
+        cnn256, cnn128 = self.image_encoder(image)
+        p256 = self.cnn_sam_projections[0](self._concat_sam(cnn256, sam_feature))
+        p128 = self.cnn_sam_projections[1](self._concat_sam(cnn128, sam_feature))
+        p64 = self.sam_projections[0](
+            F.interpolate(sam_feature, size=(64, 64), mode="bilinear", align_corners=False)
+        )
+        p32 = self.sam_projections[1](
+            F.interpolate(sam_feature, size=(32, 32), mode="bilinear", align_corners=False)
+        )
+        x = p32
+        x = self.lateral_fuse[0](p64 + F.interpolate(x, size=p64.shape[-2:], mode="bilinear", align_corners=False))
+        x = self.lateral_fuse[1](p128 + F.interpolate(x, size=p128.shape[-2:], mode="bilinear", align_corners=False))
+        x = self.lateral_fuse[2](p256 + F.interpolate(x, size=p256.shape[-2:], mode="bilinear", align_corners=False))
+        if x.shape[-2:] != self.head_resolution:
+            x = F.interpolate(x, size=self.head_resolution, mode="bilinear", align_corners=False)
+        semantic_features = self.neck(x)
+        gru_context = self.gru_context(
+            F.interpolate(sam_feature, size=self.head_resolution, mode="bilinear", align_corners=False)
+        )
+        return {"semantic_features": semantic_features, "gru_context": gru_context}
+
+
+class TransformerDecoderBlock(nn.Module):
+    def __init__(self, dim: int, heads: int, mlp_dim: int, dropout: float = 0.0):
+        super().__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.norm2 = nn.LayerNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, mlp_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_dim, dim),
+            nn.Dropout(dropout),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.norm1(x)
+        y, _ = self.attn(y, y, y, need_weights=False)
+        x = x + y
+        return x + self.mlp(self.norm2(x))
+
+
+class SegmenterStyleDecoder(nn.Module):
+    """T1 decoder: compact Segmenter-style mask transformer on final SAM tokens."""
+
+    def __init__(
+        self,
+        in_channels: int,
+        num_classes: int,
+        model_dim: int = 256,
+        depth: int = 2,
+        heads: int = 8,
+        mlp_dim: int = 1024,
+        dropout: float = 0.0,
+        token_resolution: tuple[int, int] = (32, 32),
+    ):
+        super().__init__()
+        self.num_classes = int(num_classes)
+        self.model_dim = int(model_dim)
+        self.token_resolution = tuple(int(v) for v in token_resolution)
+        self.proj = nn.Linear(in_channels, model_dim)
+        self.class_emb = nn.Parameter(torch.randn(1, num_classes, model_dim) * 0.02)
+        self.blocks = nn.ModuleList(
+            [TransformerDecoderBlock(model_dim, heads, mlp_dim, dropout=dropout) for _ in range(depth)]
+        )
+        self.norm = nn.LayerNorm(model_dim)
+        self.patch_proj = nn.Parameter(model_dim**-0.5 * torch.randn(model_dim, model_dim))
+        self.class_proj = nn.Parameter(model_dim**-0.5 * torch.randn(model_dim, model_dim))
+        self.mask_norm = nn.LayerNorm(num_classes)
+
+    def forward(
+        self,
+        feature: torch.Tensor,
+        output_size: tuple[int, int],
+        return_features: bool = False,
+    ) -> dict[str, torch.Tensor]:
+        del output_size, return_features
+        if feature.shape[-2:] != self.token_resolution:
+            feature = F.interpolate(feature, size=self.token_resolution, mode="bilinear", align_corners=False)
+        batch, _, height, width = feature.shape
+        tokens = feature.flatten(2).transpose(1, 2)
+        tokens = self.proj(tokens)
+        class_tokens = self.class_emb.expand(batch, -1, -1)
+        x = torch.cat([tokens, class_tokens], dim=1)
+        for block in self.blocks:
+            x = block(x)
+        x = self.norm(x)
+        patches = x[:, : height * width] @ self.patch_proj
+        classes = x[:, height * width :] @ self.class_proj
+        patches = F.normalize(patches, dim=-1)
+        classes = F.normalize(classes, dim=-1)
+        masks = patches @ classes.transpose(1, 2)
+        masks = self.mask_norm(masks)
+        logits = masks.transpose(1, 2).reshape(batch, self.num_classes, height, width)
+        return {"logits": logits}
+
+
 class DualDPTBoundaryDecoder(nn.Module):
     """
     Optional DA3-style DualDPT with a PIDNet-style one-channel boundary head.
@@ -430,6 +606,9 @@ class RefuseNet(nn.Module):
     S5: S4 plus iterative GRU refinement at the shared head resolution.
     S6: S2 pseudo-pyramid decoder plus a boundary head.
     S7: S2 plus iterative GRU refinement.
+    C2: final SAM feature + lightweight CNN natural scales + pyramid decoder.
+    C4: C2 plus iterative GRU refinement with final-SAM-only context.
+    T1: final SAM feature + lightweight Segmenter-style transformer decoder.
     """
 
     PRESETS: dict[str, dict[str, Any]] = {
@@ -474,6 +653,21 @@ class RefuseNet(nn.Module):
             "decoder": {"feature_mode": "pseudo_pyramid", "fusion_mode": "multiscale"},
             "refine": {"enabled": True, "type": "gru"},
         },
+        "C2": {
+            "sam": {"train_mode": "low_lr_ft"},
+            "decoder": {"feature_mode": "cnn_sam_pyramid", "fusion_mode": "cnn_sam_pyramid"},
+            "refine": {"enabled": False},
+        },
+        "C4": {
+            "sam": {"train_mode": "low_lr_ft"},
+            "decoder": {"feature_mode": "cnn_sam_pyramid", "fusion_mode": "cnn_sam_pyramid"},
+            "refine": {"enabled": True, "type": "gru"},
+        },
+        "T1": {
+            "sam": {"train_mode": "low_lr_ft"},
+            "decoder": {"feature_mode": "transformer", "fusion_mode": "segmenter"},
+            "refine": {"enabled": False},
+        },
     }
 
     DEFAULTS: dict[str, Any] = {
@@ -497,6 +691,13 @@ class RefuseNet(nn.Module):
             "fuse_type": "sum",
             "reassembly_channels": [96, 192, 384, 768],
             "dpt_head_scale": "p1",
+            "cnn_channels": 64,
+            "transformer_dim": 256,
+            "transformer_depth": 2,
+            "transformer_heads": 8,
+            "transformer_mlp_dim": 1024,
+            "transformer_dropout": 0.0,
+            "transformer_token_resolution": [32, 32],
         },
         "refine": {
             "enabled": False,
@@ -536,7 +737,9 @@ class RefuseNet(nn.Module):
         if len(self.head_resolution) != 2:
             raise ValueError(f"decoder.head_resolution must have two values, got {self.decoder_cfg['head_resolution']}")
 
-        self.classifier = None if self.setting == "S0" else nn.Conv2d(self.head_channels, self.num_classes, kernel_size=1)
+        self.classifier = (
+            None if self.setting in {"S0", "T1"} else nn.Conv2d(self.head_channels, self.num_classes, kernel_size=1)
+        )
         self.boundary_head = None
 
         if self.feature_mode == "final":
@@ -589,6 +792,25 @@ class RefuseNet(nn.Module):
                 out_channels=self.decoder_cfg["reassembly_channels"],
                 dpt_head_scale=self.decoder_cfg.get("dpt_head_scale", "p1"),
             )
+        elif self.feature_mode == "cnn_sam_pyramid":
+            self.decoder = CnnSamPyramidDecoder(
+                sam_channels=final_channels,
+                decoder_dim=decoder_dim,
+                head_channels=self.head_channels,
+                head_resolution=self.head_resolution,
+                cnn_channels=int(self.decoder_cfg.get("cnn_channels", 64)),
+            )
+        elif self.feature_mode == "transformer":
+            self.decoder = SegmenterStyleDecoder(
+                in_channels=final_channels,
+                num_classes=self.num_classes,
+                model_dim=int(self.decoder_cfg.get("transformer_dim", 256)),
+                depth=int(self.decoder_cfg.get("transformer_depth", 2)),
+                heads=int(self.decoder_cfg.get("transformer_heads", 8)),
+                mlp_dim=int(self.decoder_cfg.get("transformer_mlp_dim", 1024)),
+                dropout=float(self.decoder_cfg.get("transformer_dropout", 0.0)),
+                token_resolution=tuple(int(v) for v in self.decoder_cfg.get("transformer_token_resolution", [32, 32])),
+            )
         else:
             raise ValueError(f"Unsupported decoder.feature_mode: {self.feature_mode}")
 
@@ -638,19 +860,23 @@ class RefuseNet(nn.Module):
             raise ValueError("sam.train_mode must be 'frozen' or 'low_lr_ft'.")
         feature_mode = cfg["decoder"]["feature_mode"]
         fusion_mode = cfg["decoder"]["fusion_mode"]
-        if feature_mode not in {"final", "pseudo_pyramid", "multi_level", "dualdpt"}:
+        if feature_mode not in {"final", "pseudo_pyramid", "multi_level", "dualdpt", "cnn_sam_pyramid", "transformer"}:
             raise ValueError(f"Unsupported decoder.feature_mode: {feature_mode}")
         allowed_fusions = {
             "final": {"single"},
             "pseudo_pyramid": {"multiscale"},
             "multi_level": {"multiscale", "dpt"},
             "dualdpt": {"dualdpt"},
+            "cnn_sam_pyramid": {"cnn_sam_pyramid"},
+            "transformer": {"segmenter"},
         }
         default_fusion = {
             "final": "single",
             "pseudo_pyramid": "multiscale",
             "multi_level": "multiscale",
             "dualdpt": "dualdpt",
+            "cnn_sam_pyramid": "cnn_sam_pyramid",
+            "transformer": "segmenter",
         }[feature_mode]
         if explicit_feature and not explicit_fusion:
             cfg["decoder"]["fusion_mode"] = default_fusion
@@ -667,11 +893,34 @@ class RefuseNet(nn.Module):
         cfg["decoder"]["head_channels"] = int(cfg["decoder"]["head_channels"])
         cfg["decoder"]["head_resolution"] = [int(v) for v in cfg["decoder"]["head_resolution"]]
         cfg["decoder"]["dpt_head_scale"] = str(cfg["decoder"].get("dpt_head_scale", "p1")).lower()
+        cfg["decoder"]["cnn_channels"] = int(cfg["decoder"].get("cnn_channels", 64))
+        cfg["decoder"]["transformer_dim"] = int(cfg["decoder"].get("transformer_dim", 256))
+        cfg["decoder"]["transformer_depth"] = int(cfg["decoder"].get("transformer_depth", 2))
+        cfg["decoder"]["transformer_heads"] = int(cfg["decoder"].get("transformer_heads", 8))
+        cfg["decoder"]["transformer_mlp_dim"] = int(cfg["decoder"].get("transformer_mlp_dim", 1024))
+        cfg["decoder"]["transformer_dropout"] = float(cfg["decoder"].get("transformer_dropout", 0.0))
+        cfg["decoder"]["transformer_token_resolution"] = [
+            int(v) for v in cfg["decoder"].get("transformer_token_resolution", [32, 32])
+        ]
         cfg["refine"]["iters"] = int(cfg["refine"].get("iters", 3))
         cfg["refine"]["hidden_dim"] = int(cfg["refine"].get("hidden_dim", 64))
         cfg["refine"]["delta_scale"] = float(cfg["refine"].get("delta_scale", 1.0))
         if cfg["decoder"]["head_channels"] <= 0:
             raise ValueError("decoder.head_channels must be positive.")
+        if cfg["decoder"]["cnn_channels"] <= 0:
+            raise ValueError("decoder.cnn_channels must be positive.")
+        if cfg["decoder"]["transformer_dim"] <= 0:
+            raise ValueError("decoder.transformer_dim must be positive.")
+        if cfg["decoder"]["transformer_depth"] <= 0:
+            raise ValueError("decoder.transformer_depth must be positive.")
+        if cfg["decoder"]["transformer_heads"] <= 0:
+            raise ValueError("decoder.transformer_heads must be positive.")
+        if cfg["decoder"]["transformer_dim"] % cfg["decoder"]["transformer_heads"] != 0:
+            raise ValueError("decoder.transformer_dim must be divisible by decoder.transformer_heads.")
+        if len(cfg["decoder"]["transformer_token_resolution"]) != 2 or any(
+            v <= 0 for v in cfg["decoder"]["transformer_token_resolution"]
+        ):
+            raise ValueError("decoder.transformer_token_resolution must contain two positive integers.")
         if len(cfg["decoder"]["head_resolution"]) != 2 or any(v <= 0 for v in cfg["decoder"]["head_resolution"]):
             raise ValueError("decoder.head_resolution must contain two positive integers.")
         if cfg["decoder"]["dpt_head_scale"] != "p1":
@@ -854,12 +1103,21 @@ class RefuseNet(nn.Module):
                 else intermediate_features
             )
             decoder_out = self.decoder(decoder_inputs, output_size, return_features=self.refiner is not None or self.debug)
+        elif self.feature_mode == "cnn_sam_pyramid":
+            decoder_inputs = (sam_input, final_feature)
+            decoder_out = self.decoder(decoder_inputs, output_size, return_features=self.refiner is not None or self.debug)
+        elif self.feature_mode == "transformer":
+            decoder_inputs = final_feature
+            decoder_out = self.decoder(final_feature, output_size, return_features=self.debug)
         else:
             decoder_inputs = intermediate_features
             decoder_out = self.decoder(decoder_inputs, output_size, return_features=self.debug)
 
-        if self.setting == "S0":
-            logits = self._restore_logits(decoder_out["logits"], preprocess_meta)
+        if self.setting == "S0" or ("logits" in decoder_out and "semantic_features" not in decoder_out):
+            logits_head = decoder_out["logits"]
+            if logits_head.shape[-2:] != output_size:
+                logits_head = F.interpolate(logits_head, size=output_size, mode="bilinear", align_corners=False)
+            logits = self._restore_logits(logits_head, preprocess_meta)
             out: dict[str, torch.Tensor | None | dict[str, Any]] = {"logits": logits}
             if self.debug:
                 out["features"] = {
@@ -880,7 +1138,8 @@ class RefuseNet(nn.Module):
         aux_logits_full: list[torch.Tensor] = []
         logits_head = coarse_logits_head
         if self.refiner is not None:
-            aux_logits_head = self.refiner(coarse_logits_head, semantic_features)
+            refine_context = decoder_out.get("gru_context", semantic_features)
+            aux_logits_head = self.refiner(coarse_logits_head, refine_context)
             if aux_logits_head:
                 logits_head = aux_logits_head[-1]
             returned_coarse = self._restore_logits(

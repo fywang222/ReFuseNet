@@ -1,0 +1,81 @@
+experiment:
+  name: camvid_refusenet_s7_cityscapes_pretrained_50epoch
+  output_dir: outputs/camvid_refusenet_s7_cityscapes_pretrained_50epoch
+  seed: 42
+dataset:
+  name: camvid
+  root: data/CamVid
+  num_classes: 11
+  ignore_index: 255
+  train_split: train
+  val_split: test
+  test_split: test
+  train_list: null
+  val_list: null
+  test_list: null
+  crop_size:
+  - 360
+  - 480
+  mean:
+  - 0.485
+  - 0.456
+  - 0.406
+  std:
+  - 0.229
+  - 0.224
+  - 0.225
+model:
+  name: ReFuseNet
+  setting: S7
+  sam:
+    model_type: vit_b
+    checkpoint: checkpoints/sam_vit_b_01ec64.pth
+    train_mode: low_lr_ft
+  decoder:
+    num_classes: 11
+    dim: 128
+    head_channels: 64
+    head_resolution:
+    - 256
+    - 256
+    pseudo_scales:
+    - 4
+    - 8
+    - 16
+    - 32
+    feature_mode: pseudo_pyramid
+    fusion_mode: multiscale
+  refine:
+    enabled: true
+    type: gru
+    iters: 3
+    hidden_dim: 64
+    delta_scale: 1.0
+train:
+  epochs: 50
+  batch_size: 2
+  grad_accum_steps: 4
+  num_workers: 8
+  lr_decoder: 0.0001
+  lr_sam: 1.0e-05
+  weight_decay: 0.0001
+  amp: true
+  crop_size:
+  - 360
+  - 480
+  log_every_steps: 10
+  eval_every: 10
+  save_every: 50
+  scheduler:
+    type: poly
+    power: 1.0
+    warmup_iters: 500
+    warmup_ratio: 1.0e-06
+    min_factor: 0.0
+  lambda_aux: 0.0
+  lambda_refine_aux: 0.1
+  lambda_coarse_aux: 0.0
+eval:
+  batch_size: 4
+  inference: whole
+  save_predictions: true
