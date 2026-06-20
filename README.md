@@ -68,7 +68,7 @@ The Cityscapes loader only scans `leftImg8bit/<split>` and never falls back to `
 | S3 | SAM intermediate layers + multiscale fusion |
 | S4 | SAM intermediate layers + DPT fusion |
 | S5 | S4 + GRU refinement at `256x256` head logits |
-| S6 | S2 + boundary head |
+| S6 | S1 final feature + independent segmentation and boundary decoder heads |
 | S7 | S2 + GRU refinement |
 | C2 | SAM final feature + lightweight CNN `256/128` scales + SAM-projected `64/32` scales + FPN fusion |
 | C4 | C2 + GRU refinement; GRU context uses only SAM final feature projection |
@@ -80,7 +80,8 @@ For S1-S7 and C2/C4, the classifier input is always:
 semantic_features: [B, head_channels=64, 256, 256]
 ```
 
-S5/S7 refine head-resolution logits, not full-resolution logits. S6 adds `lambda_boundary * BCEWithLogits(boundary_logits, boundary_target)`.
+S5/S7 refine head-resolution logits, not full-resolution logits.
+S6 takes the S1 decoder feature `F`, sends it through separate segmentation and boundary decoder heads, and predicts `semantic logits` and `boundary_logits` independently. Its boundary target is generated from adjacent GT label changes while ignoring `255`, then dilated by `boundary_dilation` pixels. Boundary supervision uses `BCEWithLogitsLoss(pos_weight=neg/pos)` and the total loss is `CE(seg_logits, target) + lambda_boundary * boundary_loss`; the current S6 configs use `lambda_boundary: 0.1` and `boundary_dilation: 3`.
 C4 follows the same head-resolution GRU path, but uses a SAM-final-only `gru_context` instead of the fused decoder feature as refinement context.
 
 T1 replaces the whole semantic decoder with a compact Segmenter-style mask transformer:
@@ -139,6 +140,12 @@ C2/C4/T1 supplement runs, default GPUs `2 3 4 5 6 7` for three CamVid and three 
 
 ```bash
 bash scripts/train_refusenet_c2_c4_t1_supplement.sh
+```
+
+S6 dual-boundary experiments plus the best Cityscapes C4 `last.pth` fine-tuned on CamVid, default GPUs `5 6 7`:
+
+```bash
+bash scripts/train_boundary_s6_and_c4_camvid_gpu567.sh
 ```
 
 S5 debug, eval every epoch:

@@ -170,7 +170,7 @@ def _log_dataset_summary(logger, split: str, dataset) -> None:
         logger.info("dataset %s preview %d | image=%s | mask=%s", split, index, image_path, mask_path)
 
 
-def _boundary_targets(masks: torch.Tensor, ignore_index: int) -> tuple[torch.Tensor, torch.Tensor]:
+def _boundary_targets(masks: torch.Tensor, ignore_index: int, dilation: int = 3) -> tuple[torch.Tensor, torch.Tensor]:
     if masks.ndim != 3:
         raise ValueError(f"Expected masks with shape [B,H,W], got {tuple(masks.shape)}")
     valid = masks.ne(ignore_index)
@@ -185,7 +185,12 @@ def _boundary_targets(masks: torch.Tensor, ignore_index: int) -> tuple[torch.Ten
         boundary[:, :-1, :] |= vertical
         boundary[:, 1:, :] |= vertical
 
-    return boundary.unsqueeze(1).float(), valid.unsqueeze(1).float()
+    boundary = boundary.unsqueeze(1).float()
+    if dilation > 0:
+        kernel_size = dilation * 2 + 1
+        boundary = F.max_pool2d(boundary, kernel_size=kernel_size, stride=1, padding=dilation)
+
+    return boundary, valid.unsqueeze(1).float()
 
 
 def _compute_total_loss(cfg: dict[str, Any], outputs: dict[str, torch.Tensor], masks: torch.Tensor, criterion):
@@ -208,8 +213,17 @@ def _compute_total_loss(cfg: dict[str, Any], outputs: dict[str, torch.Tensor], m
         boundary_logits = outputs["boundary_logits"]
         if boundary_logits.shape[-2:] != masks.shape[-2:]:
             boundary_logits = F.interpolate(boundary_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
-        boundary_target, valid_mask = _boundary_targets(masks, ignore_index)
-        boundary_loss = F.binary_cross_entropy_with_logits(boundary_logits, boundary_target, reduction="none")
+        boundary_dilation = int(cfg["train"].get("boundary_dilation", 3))
+        boundary_target, valid_mask = _boundary_targets(masks, ignore_index, dilation=boundary_dilation)
+        positive = (boundary_target * valid_mask).sum()
+        negative = ((1.0 - boundary_target) * valid_mask).sum()
+        pos_weight = negative / positive.clamp_min(1.0)
+        boundary_loss = F.binary_cross_entropy_with_logits(
+            boundary_logits,
+            boundary_target,
+            pos_weight=pos_weight,
+            reduction="none",
+        )
         boundary_loss = (boundary_loss * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)
         total = total + boundary_weight * boundary_loss
         parts["boundary"] = boundary_loss

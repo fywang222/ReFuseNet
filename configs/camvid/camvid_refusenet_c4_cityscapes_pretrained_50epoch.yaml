@@ -1,30 +1,21 @@
 experiment:
-  name: cityscapes_refusenet_s6_s1_dual_boundary
-  output_dir: outputs/cityscapes_refusenet_s6_s1_dual_boundary
+  name: camvid_refusenet_c4_cityscapes_pretrained_50epoch
+  output_dir: outputs/camvid_refusenet_c4_cityscapes_pretrained_50epoch
   seed: 42
 dataset:
-  name: cityscapes
-  root: data/Cityscapes
-  num_classes: 19
+  name: camvid
+  root: data/CamVid
+  num_classes: 11
   ignore_index: 255
-  label_format: trainIds
   train_split: train
-  val_split: val
-  test_split: val
+  val_split: test
+  test_split: test
   train_list: null
   val_list: null
   test_list: null
   crop_size:
-  - 1024
-  - 1024
-  random_resize:
-    scale:
-    - 2048
-    - 1024
-    ratio_range:
-    - 0.5
-    - 2.0
-    keep_ratio: true
+  - 360
+  - 480
   mean:
   - 0.485
   - 0.456
@@ -35,49 +26,52 @@ dataset:
   - 0.225
 model:
   name: ReFuseNet
-  setting: S6
+  setting: C4
   sam:
     model_type: vit_b
     checkpoint: checkpoints/sam_vit_b_01ec64.pth
     train_mode: low_lr_ft
   decoder:
-    num_classes: 19
+    num_classes: 11
     dim: 128
     head_channels: 64
     head_resolution:
     - 256
     - 256
-    feature_mode: final
-    fusion_mode: single
-  boundary:
+    feature_mode: cnn_sam_pyramid
+    fusion_mode: cnn_sam_pyramid
+    cnn_channels: 64
+  refine:
     enabled: true
+    type: gru
+    iters: 3
+    hidden_dim: 64
+    delta_scale: 1.0
 train:
   epochs: 50
   batch_size: 2
+  grad_accum_steps: 4
   num_workers: 8
   lr_decoder: 0.0001
   lr_sam: 1.0e-05
   weight_decay: 0.0001
   amp: true
-  lambda_boundary: 0.1
-  boundary_dilation: 3
+  crop_size:
+  - 360
+  - 480
   log_every_steps: 10
-  eval_every: 5
+  eval_every: 10
   save_every: 50
   scheduler:
     type: poly
     power: 1.0
-    warmup_iters: 1500
+    warmup_iters: 500
     warmup_ratio: 1.0e-06
     min_factor: 0.0
-  grad_accum_steps: 4
+  lambda_aux: 0.0
+  lambda_refine_aux: 0.1
+  lambda_coarse_aux: 0.0
 eval:
-  batch_size: 1
-  inference: sliding
-  sliding_crop_size:
-  - 1024
-  - 1024
-  sliding_stride:
-  - 768
-  - 768
+  batch_size: 4
+  inference: whole
   save_predictions: true

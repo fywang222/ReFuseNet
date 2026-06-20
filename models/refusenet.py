@@ -38,6 +38,26 @@ class ConvGNAct(nn.Module):
         return self.block(x)
 
 
+class DualDecoderBoundaryHead(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.segmentation_decoder = nn.Sequential(
+            ConvGNAct(channels, channels),
+            ConvGNAct(channels, channels),
+        )
+        self.boundary_decoder = nn.Sequential(
+            ConvGNAct(channels, channels),
+            ConvGNAct(channels, channels),
+        )
+        self.boundary_logits = nn.Conv2d(channels, 1, kernel_size=1)
+
+    def forward(self, semantic_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        segmentation_feat = self.segmentation_decoder(semantic_features)
+        boundary_feat = self.boundary_decoder(semantic_features)
+        boundary_logits = self.boundary_logits(boundary_feat)
+        return segmentation_feat, boundary_feat, boundary_logits
+
+
 class LegacyPlainUpsampleDecoder(nn.Module):
     """S0 decoder: one final SAM image feature with the legacy private head."""
 
@@ -604,7 +624,7 @@ class RefuseNet(nn.Module):
     S3: low-LR SAM fine-tune + true 4-level SAM features + naive multiscale decoder.
     S4: low-LR SAM fine-tune + true 4-level SAM features + DPT semantic decoder.
     S5: S4 plus iterative GRU refinement at the shared head resolution.
-    S6: S2 pseudo-pyramid decoder plus a boundary head.
+    S6: S1 final-feature decoder plus independent segmentation and boundary heads.
     S7: S2 plus iterative GRU refinement.
     C2: final SAM feature + lightweight CNN natural scales + pyramid decoder.
     C4: C2 plus iterative GRU refinement with final-SAM-only context.
@@ -644,7 +664,7 @@ class RefuseNet(nn.Module):
         },
         "S6": {
             "sam": {"train_mode": "low_lr_ft"},
-            "decoder": {"feature_mode": "pseudo_pyramid", "fusion_mode": "multiscale"},
+            "decoder": {"feature_mode": "final", "fusion_mode": "single"},
             "refine": {"enabled": False},
             "boundary": {"enabled": True},
         },
@@ -826,10 +846,7 @@ class RefuseNet(nn.Module):
                 delta_scale=float(self.refine_cfg.get("delta_scale", 1.0)),
             )
         if bool(self.boundary_cfg.get("enabled", False)) and self.feature_mode != "dualdpt":
-            self.boundary_head = nn.Sequential(
-                ConvGNAct(self.head_channels, self.head_channels),
-                nn.Conv2d(self.head_channels, 1, kernel_size=1),
-            )
+            self.boundary_head = DualDecoderBoundaryHead(self.head_channels)
 
     @classmethod
     def resolve_config(cls, model_cfg: dict[str, Any]) -> dict[str, Any]:
@@ -1131,6 +1148,12 @@ class RefuseNet(nn.Module):
         self._assert_head_features(semantic_features)
         if self.classifier is None:
             raise RuntimeError(f"{self.setting} requires a shared classifier.")
+        boundary_logits_head = None
+        boundary_features = None
+        if self.boundary_head is not None:
+            semantic_features, boundary_features, boundary_logits_head = self.boundary_head(semantic_features)
+            self._assert_head_features(semantic_features)
+
         coarse_logits_head = self.classifier(semantic_features)
 
         returned_coarse = None
@@ -1167,16 +1190,15 @@ class RefuseNet(nn.Module):
             out["aux_logits_head"] = aux_logits_head
         if "boundary_logits" in decoder_out:
             out["boundary_logits"] = self._restore_logits(decoder_out["boundary_logits"], preprocess_meta)
-        elif self.boundary_head is not None:
-            boundary_logits = self.boundary_head(semantic_features)
-            boundary_logits = F.interpolate(boundary_logits, size=output_size, mode="bilinear", align_corners=False)
+        elif boundary_logits_head is not None:
+            boundary_logits = F.interpolate(boundary_logits_head, size=output_size, mode="bilinear", align_corners=False)
             out["boundary_logits"] = self._restore_logits(boundary_logits, preprocess_meta)
         if self.debug:
             out["features"] = {
                 "final": final_feature,
                 "decoder_inputs": decoder_inputs,
                 "decoder": semantic_features,
-                "boundary": decoder_out.get("boundary_features"),
+                "boundary": boundary_features if boundary_features is not None else decoder_out.get("boundary_features"),
             }
         return out
 
