@@ -47,18 +47,12 @@ run_one() {
   name="$(basename "${config}" .yaml)"
 
   echo "[launch] GPU=${gpu} config=${config} pretrained=${pretrained:-none}"
+  local args=(--config "${config}" --device "${DEVICE}")
   if [[ -n "${pretrained}" ]]; then
-    CUDA_VISIBLE_DEVICES="${gpu}" "${PYTHON}" tools/train.py \
-      --config "${config}" \
-      --pretrained "${pretrained}" \
-      --device "${DEVICE}" \
-      2>&1 | tee "outputs/logs/${name}.console.log"
-  else
-    CUDA_VISIBLE_DEVICES="${gpu}" "${PYTHON}" tools/train.py \
-      --config "${config}" \
-      --device "${DEVICE}" \
-      2>&1 | tee "outputs/logs/${name}.console.log"
+    args+=(--pretrained "${pretrained}")
   fi
+  CUDA_VISIBLE_DEVICES="${gpu}" "${PYTHON}" tools/train.py "${args[@]}" \
+    2>&1 | tee "outputs/logs/${name}.console.log"
 }
 
 pids=()

@@ -31,11 +31,6 @@ model:
     model_type: vit_b
     checkpoint: checkpoints/sam_vit_b_01ec64.pth
     train_mode: low_lr_ft
-    intermediate_blocks:
-    - 3
-    - 6
-    - 9
-    - 12
   decoder:
     num_classes: 11
     dim: 128
@@ -43,16 +38,19 @@ model:
     head_resolution:
     - 256
     - 256
-    feature_mode: multi_level
-    fusion_mode: dpt
-    reassembly_channels:
-    - 96
-    - 192
-    - 384
-    - 768
-    dpt_head_scale: p1
+    pseudo_scales:
+    - 4
+    - 8
+    - 16
+    - 32
+    feature_mode: pseudo_pyramid
+    fusion_mode: multiscale
   refine:
-    enabled: false
+    enabled: true
+    type: gru
+    iters: 3
+    hidden_dim: 64
+    delta_scale: 1.0
 train:
   epochs: 200
   batch_size: 2
@@ -74,6 +72,9 @@ train:
     warmup_iters: 500
     warmup_ratio: 1.0e-06
     min_factor: 0.0
+  lambda_aux: 0.0
+  lambda_refine_aux: 0.1
+  lambda_coarse_aux: 0.0
 eval:
   batch_size: 4
   inference: whole

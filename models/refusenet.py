@@ -41,15 +41,13 @@ class ConvGNAct(nn.Module):
 class DualDecoderBoundaryHead(nn.Module):
     def __init__(self, channels: int):
         super().__init__()
-        self.segmentation_decoder = nn.Sequential(
-            ConvGNAct(channels, channels),
-            ConvGNAct(channels, channels),
-        )
-        self.boundary_decoder = nn.Sequential(
-            ConvGNAct(channels, channels),
-            ConvGNAct(channels, channels),
-        )
+        self.segmentation_decoder = self._make_decoder(channels)
+        self.boundary_decoder = self._make_decoder(channels)
         self.boundary_logits = nn.Conv2d(channels, 1, kernel_size=1)
+
+    @staticmethod
+    def _make_decoder(channels: int) -> nn.Sequential:
+        return nn.Sequential(ConvGNAct(channels, channels), ConvGNAct(channels, channels))
 
     def forward(self, semantic_features: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         segmentation_feat = self.segmentation_decoder(semantic_features)
@@ -262,7 +260,7 @@ class DPTReassembly(nn.Module):
 
 class DPTSemanticDecoder(nn.Module):
     """
-    S4/S5 decoder: shared reassembly plus one semantic DPT top-down fusion branch.
+    S5 decoder: shared reassembly plus one semantic DPT top-down fusion branch.
 
     This intentionally has no boundary branch. Dual-branch boundary decoding is
     kept in the optional DualDPTBoundaryDecoder.
@@ -576,7 +574,7 @@ class ConvGRUCell(nn.Module):
 
 
 class GRURefiner(nn.Module):
-    """S5 refinement: shared iterative hidden-state updates on head-resolution logits."""
+    """S4 refinement: shared iterative hidden-state updates on head-resolution logits."""
 
     def __init__(
         self,
@@ -622,10 +620,9 @@ class RefuseNet(nn.Module):
     S1: low-LR SAM fine-tune + final feature + plain decoder.
     S2: low-LR SAM fine-tune + pseudo 4-scale features + naive multiscale decoder.
     S3: low-LR SAM fine-tune + true 4-level SAM features + naive multiscale decoder.
-    S4: low-LR SAM fine-tune + true 4-level SAM features + DPT semantic decoder.
-    S5: S4 plus iterative GRU refinement at the shared head resolution.
+    S4: S2 plus iterative GRU refinement at the shared head resolution.
+    S5: low-LR SAM fine-tune + true 4-level SAM features + DPT semantic decoder.
     S6: S1 final-feature decoder plus independent segmentation and boundary heads.
-    S7: S2 plus iterative GRU refinement.
     C2: final SAM feature + lightweight CNN natural scales + pyramid decoder.
     C4: C2 plus iterative GRU refinement with final-SAM-only context.
     T1: final SAM feature + lightweight Segmenter-style transformer decoder.
@@ -654,24 +651,19 @@ class RefuseNet(nn.Module):
         },
         "S4": {
             "sam": {"train_mode": "low_lr_ft"},
-            "decoder": {"feature_mode": "multi_level", "fusion_mode": "dpt"},
-            "refine": {"enabled": False},
+            "decoder": {"feature_mode": "pseudo_pyramid", "fusion_mode": "multiscale"},
+            "refine": {"enabled": True, "type": "gru"},
         },
         "S5": {
             "sam": {"train_mode": "low_lr_ft"},
             "decoder": {"feature_mode": "multi_level", "fusion_mode": "dpt"},
-            "refine": {"enabled": True, "type": "gru"},
+            "refine": {"enabled": False},
         },
         "S6": {
             "sam": {"train_mode": "low_lr_ft"},
             "decoder": {"feature_mode": "final", "fusion_mode": "single"},
             "refine": {"enabled": False},
             "boundary": {"enabled": True},
-        },
-        "S7": {
-            "sam": {"train_mode": "low_lr_ft"},
-            "decoder": {"feature_mode": "pseudo_pyramid", "fusion_mode": "multiscale"},
-            "refine": {"enabled": True, "type": "gru"},
         },
         "C2": {
             "sam": {"train_mode": "low_lr_ft"},
@@ -1041,6 +1033,16 @@ class RefuseNet(nn.Module):
             logits = F.interpolate(logits, size=orig_size, mode="bilinear", align_corners=False)
         return logits
 
+    def _restore_head_logits(
+        self,
+        logits: torch.Tensor,
+        output_size: tuple[int, int],
+        meta: dict[str, tuple[int, int] | tuple[int, int, int, int]],
+    ) -> torch.Tensor:
+        if logits.shape[-2:] != output_size:
+            logits = F.interpolate(logits, size=output_size, mode="bilinear", align_corners=False)
+        return self._restore_logits(logits, meta)
+
     def _run_sam_encoder(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         if self.feature_mode in {"multi_level", "dualdpt"}:
             return self._run_sam_encoder_with_intermediates(x)
@@ -1131,10 +1133,7 @@ class RefuseNet(nn.Module):
             decoder_out = self.decoder(decoder_inputs, output_size, return_features=self.debug)
 
         if self.setting == "S0" or ("logits" in decoder_out and "semantic_features" not in decoder_out):
-            logits_head = decoder_out["logits"]
-            if logits_head.shape[-2:] != output_size:
-                logits_head = F.interpolate(logits_head, size=output_size, mode="bilinear", align_corners=False)
-            logits = self._restore_logits(logits_head, preprocess_meta)
+            logits = self._restore_head_logits(decoder_out["logits"], output_size, preprocess_meta)
             out: dict[str, torch.Tensor | None | dict[str, Any]] = {"logits": logits}
             if self.debug:
                 out["features"] = {
@@ -1165,22 +1164,13 @@ class RefuseNet(nn.Module):
             aux_logits_head = self.refiner(coarse_logits_head, refine_context)
             if aux_logits_head:
                 logits_head = aux_logits_head[-1]
-            returned_coarse = self._restore_logits(
-                F.interpolate(coarse_logits_head, size=output_size, mode="bilinear", align_corners=False),
-                preprocess_meta,
-            )
+            returned_coarse = self._restore_head_logits(coarse_logits_head, output_size, preprocess_meta)
             aux_logits_full = [
-                self._restore_logits(
-                    F.interpolate(aux_head, size=output_size, mode="bilinear", align_corners=False),
-                    preprocess_meta,
-                )
+                self._restore_head_logits(aux_head, output_size, preprocess_meta)
                 for aux_head in aux_logits_head
             ]
 
-        logits = self._restore_logits(
-            F.interpolate(logits_head, size=output_size, mode="bilinear", align_corners=False),
-            preprocess_meta,
-        )
+        logits = self._restore_head_logits(logits_head, output_size, preprocess_meta)
 
         out: dict[str, torch.Tensor | None | dict[str, Any]] = {"logits": logits}
         if returned_coarse is not None:
@@ -1191,8 +1181,7 @@ class RefuseNet(nn.Module):
         if "boundary_logits" in decoder_out:
             out["boundary_logits"] = self._restore_logits(decoder_out["boundary_logits"], preprocess_meta)
         elif boundary_logits_head is not None:
-            boundary_logits = F.interpolate(boundary_logits_head, size=output_size, mode="bilinear", align_corners=False)
-            out["boundary_logits"] = self._restore_logits(boundary_logits, preprocess_meta)
+            out["boundary_logits"] = self._restore_head_logits(boundary_logits_head, output_size, preprocess_meta)
         if self.debug:
             out["features"] = {
                 "final": final_feature,

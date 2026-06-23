@@ -24,8 +24,6 @@ CONFIGS=(
   "configs/camvid/camvid_refusenet_s2.yaml"
   "configs/camvid/camvid_refusenet_s3.yaml"
   "configs/camvid/camvid_refusenet_s4.yaml"
-  "configs/camvid/camvid_refusenet_s5.yaml"
-  "configs/camvid/camvid_refusenet_s7.yaml"
 )
 
 run_one() {

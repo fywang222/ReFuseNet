@@ -193,6 +193,12 @@ def _boundary_targets(masks: torch.Tensor, ignore_index: int, dilation: int = 3)
     return boundary, valid.unsqueeze(1).float()
 
 
+def _boundary_pos_weight(boundary_target: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    positive = (boundary_target * valid_mask).sum()
+    negative = ((1.0 - boundary_target) * valid_mask).sum()
+    return negative / positive.clamp_min(1.0)
+
+
 def _compute_total_loss(cfg: dict[str, Any], outputs: dict[str, torch.Tensor], masks: torch.Tensor, criterion):
     ignore_index = int(cfg["dataset"].get("ignore_index", 255))
     total = criterion(outputs["logits"], masks)
@@ -215,13 +221,10 @@ def _compute_total_loss(cfg: dict[str, Any], outputs: dict[str, torch.Tensor], m
             boundary_logits = F.interpolate(boundary_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
         boundary_dilation = int(cfg["train"].get("boundary_dilation", 3))
         boundary_target, valid_mask = _boundary_targets(masks, ignore_index, dilation=boundary_dilation)
-        positive = (boundary_target * valid_mask).sum()
-        negative = ((1.0 - boundary_target) * valid_mask).sum()
-        pos_weight = negative / positive.clamp_min(1.0)
         boundary_loss = F.binary_cross_entropy_with_logits(
             boundary_logits,
             boundary_target,
-            pos_weight=pos_weight,
+            pos_weight=_boundary_pos_weight(boundary_target, valid_mask),
             reduction="none",
         )
         boundary_loss = (boundary_loss * valid_mask).sum() / valid_mask.sum().clamp_min(1.0)

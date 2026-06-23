@@ -1,6 +1,13 @@
 # ReFuseNet
 
-Semantic segmentation experiments on CamVid and Cityscapes. Training uses raw logits with `CrossEntropyLoss(ignore_index=255)`.
+> **Course project** for *Image Processing and Machine Vision* (IPMV),
+> Fudan University, Spring 2026.
+
+Refined Feature Fusion for transferring the Segment Anything Model (SAM ViT-B) to
+small-scale semantic segmentation. This repository contains the training,
+evaluation, and analysis code, together with the LaTeX sources of the paper.
+
+**Paper**: [`paper.pdf`](./paper.pdf) 
 
 ## Setup
 
@@ -66,21 +73,20 @@ The Cityscapes loader only scans `leftImg8bit/<split>` and never falls back to `
 | S1 | SAM low-LR fine-tune + final feature |
 | S2 | SAM low-LR fine-tune + pseudo pyramid `256/128/64/32` |
 | S3 | SAM intermediate layers + multiscale fusion |
-| S4 | SAM intermediate layers + DPT fusion |
-| S5 | S4 + GRU refinement at `256x256` head logits |
+| S4 | S2 + GRU refinement at `256x256` head logits |
+| S5 | SAM intermediate layers + DPT fusion |
 | S6 | S1 final feature + independent segmentation and boundary decoder heads |
-| S7 | S2 + GRU refinement |
 | C2 | SAM final feature + lightweight CNN `256/128` scales + SAM-projected `64/32` scales + FPN fusion |
 | C4 | C2 + GRU refinement; GRU context uses only SAM final feature projection |
 | T1 | SAM final feature + lightweight Segmenter-style transformer decoder |
 
-For S1-S7 and C2/C4, the classifier input is always:
+For S1-S6 and C2/C4, the classifier input is always:
 
 ```text
 semantic_features: [B, head_channels=64, 256, 256]
 ```
 
-S5/S7 refine head-resolution logits, not full-resolution logits.
+S4 refines head-resolution logits, while S5 uses the DPT decoder without refinement.
 S6 takes the S1 decoder feature `F`, sends it through separate segmentation and boundary decoder heads, and predicts `semantic logits` and `boundary_logits` independently. Its boundary target is generated from adjacent GT label changes while ignoring `255`, then dilated by `boundary_dilation` pixels. Boundary supervision uses `BCEWithLogitsLoss(pos_weight=neg/pos)` and the total loss is `CE(seg_logits, target) + lambda_boundary * boundary_loss`; the current S6 configs use `lambda_boundary: 0.1` and `boundary_dilation: 3`.
 C4 follows the same head-resolution GRU path, but uses a SAM-final-only `gru_context` instead of the fused decoder feature as refinement context.
 
@@ -106,7 +112,7 @@ Batch and accumulation:
 | --- | ---: | ---: |
 | FCN | 8 | 1 |
 | SegFormer-B5 | 4 | 2 |
-| ReFuseNet S0-S7/C2/C4/T1 | 2 | 4 |
+| ReFuseNet S0-S6/C2/C4/T1 | 2 | 4 |
 
 All configs use AdamW with linear warmup and poly LR decay. Scheduler steps on optimizer steps, so it respects gradient accumulation.
 
@@ -189,8 +195,36 @@ Metric logic:
 - `union == 0` classes are `NaN`
 - mIoU is `np.nanmean(per_class_iou)`
 
+Long-tail and per-class evaluation for multiple checkpoints:
+
+```bash
+python tools/longtail_eval.py \
+  --model s2,camvid,data/CamVid,outputs/camvid_refusenet_s2/last.pth \
+  --model s4_ft,camvid,data/CamVid,outputs/camvid_refusenet_s4_cityscapes_pretrained_50epoch/last.pth \
+  --output outputs/longtail_eval/camvid_models.csv \
+  --device cuda
+```
+
+For larger batches, pass `--models-csv path/to/models.csv` with columns:
+
+```csv
+name,dataset,root,checkpoint
+s2,camvid,data/CamVid,outputs/camvid_refusenet_s2/last.pth
+c4,cityscapes,data/Cityscapes,outputs/cityscapes_refusenet_c4_cnn_sam_refine/last.pth
+```
+
+The output CSV has one row per `(run, class)` and includes `iou`, `class_acc`, `intersection`, `union`, class frequency, rare/small class flags, and `overall_miou`.
+
 ## References
 
+- FCN: https://arxiv.org/abs/1411.4038
+- SegFormer: https://arxiv.org/abs/2105.15203
+- SegFormer-B5 checkpoint: https://huggingface.co/nvidia/mit-b5
+- Segment Anything: https://arxiv.org/abs/2304.02643
+- Segment Anything code and ViT-B checkpoint: https://github.com/facebookresearch/segment-anything
+- DPT: https://arxiv.org/abs/2103.13413
+- Segmenter: https://arxiv.org/abs/2105.05633
+- GRU: https://arxiv.org/abs/1406.1078
 - torchvision pretrained weights: https://docs.pytorch.org/vision/stable/models.html
-- SegFormer-B5: https://huggingface.co/nvidia/mit-b5
-- Segment Anything: https://github.com/facebookresearch/segment-anything
+- CamVid: http://mi.eng.cam.ac.uk/research/projects/VideoRec/CamVid/
+- Cityscapes: https://www.cityscapes-dataset.com/

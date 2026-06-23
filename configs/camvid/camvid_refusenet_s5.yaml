@@ -1,6 +1,6 @@
 experiment:
-  name: camvid_refusenet_s5_dpt_refine
-  output_dir: outputs/camvid_refusenet_s5_dpt_refine
+  name: camvid_refusenet_s5
+  output_dir: outputs/camvid_refusenet_s5
   seed: 42
 dataset:
   name: camvid
@@ -52,11 +52,7 @@ model:
     - 768
     dpt_head_scale: p1
   refine:
-    enabled: true
-    type: gru
-    iters: 3
-    hidden_dim: 64
-    delta_scale: 1.0
+    enabled: false
 train:
   epochs: 200
   batch_size: 2
@@ -70,7 +66,7 @@ train:
   - 360
   - 480
   lambda_aux: 0.0
-  lambda_refine_aux: 0.1
+  lambda_refine_aux: 0.0
   lambda_coarse_aux: 0.0
   log_every_steps: 10
   eval_every: 10

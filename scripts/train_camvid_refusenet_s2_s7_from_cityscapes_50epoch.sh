@@ -22,12 +22,12 @@ fi
 
 CONFIGS=(
   "configs/camvid/camvid_refusenet_s2_cityscapes_pretrained_50epoch.yaml"
-  "configs/camvid/camvid_refusenet_s7_cityscapes_pretrained_50epoch.yaml"
+  "configs/camvid/camvid_refusenet_s4_cityscapes_pretrained_50epoch.yaml"
 )
 
 PRETRAINED=(
   "outputs/cityscapes_refusenet_s2/last.pth"
-  "outputs/cityscapes_refusenet_s7_pseudo_refine/last.pth"
+  "outputs/cityscapes_refusenet_s4_pseudo_refine/last.pth"
 )
 
 for checkpoint in "${PRETRAINED[@]}"; do
@@ -70,4 +70,4 @@ if (( failed != 0 )); then
   exit 1
 fi
 
-echo "S2 and S7 Cityscapes-to-CamVid 50-epoch fine-tuning finished."
+echo "S2 and S4 Cityscapes-to-CamVid 50-epoch fine-tuning finished."
