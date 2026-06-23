@@ -7,7 +7,42 @@ Refined Feature Fusion for transferring the Segment Anything Model (SAM ViT-B) t
 small-scale semantic segmentation. This repository contains the training,
 evaluation, and analysis code, together with the LaTeX sources of the paper.
 
-**Paper**: [`paper.pdf`](./paper.pdf) 
+**Paper**: [`docs/paper.pdf`](./docs/paper.pdf) 
+
+## Model Architecture
+
+ReFuseNet keeps the SAM ViT-B image encoder and adds a small, lightweight
+decoder on top. The recommended `C4` variant runs a parallel CNN image branch
+at native resolution, fuses it with the projected SAM semantic features through
+an FPN-style pyramid, and iteratively refines the head-resolution logits with
+a GRU. The other variants (`S0`–`S6`, `C2`, `T1`) ablate pieces of this design
+(pseudo multi-scale pyramids, intermediate SAM features, DPT-style decoders,
+auxiliary boundary heads, etc.) — see the [Models](#models) section.
+
+![ReFuseNet architecture](./docs/model.png)
+
+## Main Results
+
+Across the two datasets, `C4` is the strongest SAM-based variant while keeping
+the parameter budget in the same range as the smaller variants. Cityscapes
+pretraining followed by CamVid fine-tuning (`C4*`) further pushes CamVid to
+**84.45 mIoU**.
+
+| Method | Params (M) | CamVid mIoU (%) | CamVid Pixel Acc. (%) | Cityscapes mIoU (%) | Cityscapes Pixel Acc. (%) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| FCN-ResNet50 | 32.95 | 75.91 | 94.81 | 73.50 | 95.55 |
+| SegFormer-B5 | 84.60 | 77.92 | 95.60 | **80.74** | 96.51 |
+| ReFuseNet S0 | 90.15 | 75.91 | 95.04 | 59.11 | 93.95 |
+| ReFuseNet S1 | 90.16 | 81.79 | 96.39 | 78.14 | 96.35 |
+| ReFuseNet S2 | 90.25 | 81.55 | 96.42 | 78.27 | 96.46 |
+| ReFuseNet S3 | 90.52 | 80.53 | 96.26 | 77.42 | 96.36 |
+| ReFuseNet C2 | 91.80 | 82.06 | 96.58 | 78.69 | 96.58 |
+| **ReFuseNet C4** | 92.07 | 82.07 | 96.40 | 78.72 | 96.58 |
+| ReFuseNet T1 | 93.03 | 78.09 | 95.90 | 76.43 | 96.04 |
+| **ReFuseNet C4\*** | 92.07 | **84.45** | **96.87** | -- | -- |
+
+`C4*` is `C4` pretrained on Cityscapes (50 epochs) and then fine-tuned on
+CamVid for 50 epochs. 
 
 ## Setup
 
